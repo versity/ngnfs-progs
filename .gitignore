@@ -1,0 +1,8 @@
+*.[odis]
+*.h.gch
+.*.swp
+cscope.*
+.sparse.*
+shared/generated-trace-inlines.h
+cli/ngnfs-cli
+devd/ngnfs-devd
