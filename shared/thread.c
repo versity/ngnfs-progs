@@ -15,6 +15,7 @@
 #include "shared/log.h"
 #include "shared/thread.h"
 #include "shared/trace.h"
+#include "assert.h"
 
 enum {
 	THR_CREATED = 0,
