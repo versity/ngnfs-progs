@@ -1,3 +1,40 @@
+## Building the code
+
+You will need to install the userspace RCU development libraries. The package
+name varies on different distros, but is probably one of:
+
+- liburcu-dev
+- userspace-rcu-devel
+
+To install from source, see [https://liburcu.org/](https://liburcu.org/)
+
+To build:
+
+```
+$ make
+```
+
+## Running the code
+
+ngnfs development current uses two userspace programs: the devd
+server, which serves block read/write requests, and the debugfs
+command, which issues requests to the devd server to create and read
+file system structures. Use the following steps to run them:
+
+Make a fake device file and start the devd server:
+
+```
+$ truncate /tmp/dev -s 1G
+$ ./devd/ngnfs-devd --device_path /tmp/dev --listen_addr 127.0.0.1:8080 --trace /tmp/trace
+```
+
+Use the debugfs command to mkfs and stat the root inode:
+
+```
+$ ./cli/ngnfs-cli debugfs --devd_addr 127.0.0.1:8080 --trace /tmp/trace2
+<1> $ mkfs
+<1> $ stat
+```
 
 ## Code Layout
 
