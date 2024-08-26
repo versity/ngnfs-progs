@@ -259,7 +259,7 @@ void trace_flush(void)
 	rcu_read_unlock();
 
 	/* wait for writer to finish with queued bufs */
-	wait_event(&trinf->waitq, !cds_wfcq_empty(&trinf->write_head, &trinf->write_tail));
+	wait_event(&trinf->waitq, cds_wfcq_empty(&trinf->write_head, &trinf->write_tail));
 }
 
 static void put_list_bufs(struct list_head *list)
