@@ -6,3 +6,4 @@ cscope.*
 shared/generated-trace-inlines.h
 cli/ngnfs-cli
 devd/ngnfs-devd
+manifest/ngnfs-manifest
