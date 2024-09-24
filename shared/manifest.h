@@ -12,6 +12,9 @@ struct ngnfs_manifest_addr_head {
 	struct sockaddr_in addr;
 };
 
+int ngnfs_manifest_append_addr(u8 *nr_addrs, struct list_head *addr_list, char *str);
+void ngnfs_manifest_free_addrs(struct list_head *addr_list);
+
 int ngnfs_manifest_map_block(struct ngnfs_fs_info *nfi, u64 bnr, struct sockaddr_in *addr);
 int ngnfs_manifest_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr);
 void ngnfs_manifest_destroy(struct ngnfs_fs_info *nfi);
