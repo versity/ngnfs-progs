@@ -32,12 +32,18 @@
 #include "shared/trace.h"
 
 struct mount_options {
-	struct list_head addr_list;
-	u8 nr_addrs;
+	struct sockaddr_in manifest_server_addr;
+	u8 nr_maddrs;
+	struct list_head devd_addr_list;
+	u8 nr_daddrs;
 	char *trace_path;
 };
 
 static struct option_more mount_moreopts[] = {
+	{ .longopt = { "addr", required_argument, NULL, 'a' },
+	  .arg = "addr:port",
+	  .desc = "IPv4 address and port of manifest server to query", },
+
 	{ .longopt = { "devd_addr", required_argument, NULL, 'd' },
 	  .arg = "addr:port",
 	  .desc = "IPv4 address of devd server", },
@@ -54,8 +60,12 @@ static int parse_mount_opt(int c, char *str, void *arg)
 	int ret = -EINVAL;
 
 	switch(c) {
+	case 'a':
+		ret = parse_ipv4_addr_port(&opts->manifest_server_addr, str);
+		opts->nr_maddrs = 1;
+		break;
 	case 'd':
-		ret = ngnfs_manifest_append_addr(&opts->nr_addrs, &opts->addr_list, str);
+		ret = ngnfs_manifest_append_addr(&opts->nr_daddrs, &opts->devd_addr_list, str);
 		break;
 	case 't':
 		ret = strdup_nerr(&opts->trace_path, str);
@@ -67,7 +77,7 @@ static int parse_mount_opt(int c, char *str, void *arg)
 
 int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 {
-	struct mount_options opts = { .addr_list = LIST_HEAD_INIT(opts.addr_list), };
+	struct mount_options opts = { .devd_addr_list = LIST_HEAD_INIT(opts.devd_addr_list), };
 	int ret;
 
 	ret = getopt_long_more(argc, argv, mount_moreopts, ARRAY_SIZE(mount_moreopts),
@@ -75,21 +85,21 @@ int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 	if (ret < 0)
 		goto out;
 
-	if (opts.nr_addrs == 0) {
-		log("no -d devd addresses specified");
+	if ((opts.nr_maddrs == 0) && (opts.nr_daddrs == 0)) {
+		log("must have one of -a or -d to supply devd addresses");
 		ret = -EINVAL;
 		goto out;
 	}
 
 	ret = trace_setup(opts.trace_path) ?:
 	      ngnfs_msg_setup(nfi, &ngnfs_mtr_socket_ops, NULL, NULL) ?:
-	      ngnfs_manifest_client_setup(nfi, NULL, &opts.addr_list, opts.nr_addrs) ?:
+	      ngnfs_manifest_client_setup(nfi, &opts.manifest_server_addr, &opts.devd_addr_list, opts.nr_daddrs) ?:
 	      ngnfs_block_setup(nfi, &ngnfs_btr_msg_ops, NULL);
 out:
 	if (ret < 0)
 		ngnfs_unmount(nfi);
 
-	ngnfs_manifest_free_addrs(&opts.addr_list);
+	ngnfs_manifest_free_addrs(&opts.devd_addr_list);
 
 	return ret;
 }
