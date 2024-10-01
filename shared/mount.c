@@ -83,7 +83,7 @@ int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 
 	ret = trace_setup(opts.trace_path) ?:
 	      ngnfs_msg_setup(nfi, &ngnfs_mtr_socket_ops, NULL, NULL) ?:
-	      ngnfs_manifest_client_setup(nfi, &opts.addr_list, opts.nr_addrs) ?:
+	      ngnfs_manifest_client_setup(nfi, NULL, &opts.addr_list, opts.nr_addrs) ?:
 	      ngnfs_block_setup(nfi, &ngnfs_btr_msg_ops, NULL);
 out:
 	if (ret < 0)

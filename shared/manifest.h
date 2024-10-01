@@ -19,7 +19,7 @@ int ngnfs_manifest_map_block(struct ngnfs_fs_info *nfi, u64 bnr, struct sockaddr
 
 int ngnfs_manifest_request(struct ngnfs_fs_info *nfi, struct sockaddr_in *addr);
 
-int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr);
+int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct sockaddr_in *manifest_server_addr, struct list_head *list, u8 nr);
 void ngnfs_manifest_client_destroy(struct ngnfs_fs_info *nfi);
 
 int ngnfs_manifest_server_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr);

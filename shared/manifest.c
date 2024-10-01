@@ -517,7 +517,7 @@ void ngnfs_manifest_client_destroy(struct ngnfs_fs_info *nfi)
 	manifest_info_destroy(nfi);
 }
 
-int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr)
+int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct sockaddr_in *manifest_server_addr, struct list_head *list, u8 nr)
 {
 	int ret;
 
@@ -533,7 +533,15 @@ int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct list_head *lis
 	if (ret < 0)
 		goto out;
 
-	ret = manifest_contents_setup(nfi, list, nr);
+	/*
+	 * Only ask for a manifest from the manifest server if no devices are
+	 * specified on the command line. Presumably the user has good reason to
+	 * force that.
+	 */
+	if (nr != 0)
+		ret = manifest_contents_setup(nfi, list, nr);
+	else
+		ret = ngnfs_manifest_request(nfi, manifest_server_addr);
 out:
 	if (ret < 0)
 		ngnfs_manifest_client_destroy(nfi);
