@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
 /*
- * Each manifest server keeps lists of properties of the ngnfs cluster that all
- * the nodes need to agree on (such as which nodes are currently up and
- * running). A quorum of manifest servers needs to agree on any changes
- * (including changes in which manifest servers are up and participating in
- * quorum).
+ * Each mapd server keeps lists of properties of the ngnfs cluster that all the
+ * nodes need to agree on (such as which nodes are currently up and running). A
+ * quorum of mapd servers needs to agree on any changes (including changes in
+ * which mapd servers are up and participating in quorum).
  */
 
 #include <unistd.h>
@@ -30,7 +29,7 @@
 #include "shared/thread.h"
 #include "shared/trace.h"
 
-struct manifest_options {
+struct mapd_options {
 	char *storage_dir;
 	struct sockaddr_in listen_addr;
 	struct list_head addr_list;
@@ -38,7 +37,7 @@ struct manifest_options {
 	char *trace_path;
 };
 
-static struct option_more manifest_moreopts[] = {
+static struct option_more mapd_moreopts[] = {
 	{ .longopt = { "storage_dir", required_argument, NULL, 's' },
 	  .arg = "dir_path",
 	  .desc = "path to directory used to store persistent data",
@@ -60,9 +59,9 @@ static struct option_more manifest_moreopts[] = {
 	  .required = 1, },
 };
 
-static int parse_manifest_opt(int c, char *str, void *arg)
+static int parse_mapd_opt(int c, char *str, void *arg)
 {
-	struct manifest_options *opts = arg;
+	struct mapd_options *opts = arg;
 	int ret = -EINVAL;
 
 	switch(c) {
@@ -73,7 +72,7 @@ static int parse_manifest_opt(int c, char *str, void *arg)
 		ret = parse_ipv4_addr_port(&opts->listen_addr, str);
 		break;
 	case 'd':
-		ret = ngnfs_manifest_append_addr(&opts->nr_addrs, &opts->addr_list, str);
+		ret = ngnfs_map_append_addr(&opts->nr_addrs, &opts->addr_list, str);
 		break;
 	case 't':
 		ret = strdup_nerr(&opts->trace_path, str);
@@ -86,12 +85,12 @@ static int parse_manifest_opt(int c, char *str, void *arg)
 int main(int argc, char **argv)
 {
 	struct ngnfs_fs_info nfi = INIT_NGNFS_FS_INFO;
-	struct manifest_options opts = { .addr_list = LIST_HEAD_INIT(opts.addr_list), };
+	struct mapd_options opts = { .addr_list = LIST_HEAD_INIT(opts.addr_list), };
 	int ret;
 
-	ret = getopt_long_more(argc, argv, manifest_moreopts,
-						   ARRAY_SIZE(manifest_moreopts),
-						   parse_manifest_opt, &opts);
+	ret = getopt_long_more(argc, argv, mapd_moreopts,
+						   ARRAY_SIZE(mapd_moreopts),
+						   parse_mapd_opt, &opts);
 	if (ret < 0)
 		goto out;
 
@@ -101,14 +100,14 @@ int main(int argc, char **argv)
 
 	ret = trace_setup(opts.trace_path) ?:
 	      ngnfs_msg_setup(&nfi, &ngnfs_mtr_socket_ops, NULL, &opts.listen_addr) ?:
-	      ngnfs_manifest_server_setup(&nfi, &opts.addr_list, opts.nr_addrs) ?:
+	      ngnfs_map_server_setup(&nfi, &opts.addr_list, opts.nr_addrs) ?:
 	      thread_sigwait();
 
-	ngnfs_manifest_server_destroy(&nfi);
+	ngnfs_map_server_destroy(&nfi);
 	ngnfs_msg_destroy(&nfi);
 
 	thread_finish_main();
 out:
-	ngnfs_manifest_free_addrs(&opts.addr_list);
+	ngnfs_map_free_addrs(&opts.addr_list);
 	return !!ret;
 }

@@ -12,8 +12,8 @@ enum {
 	NGNFS_MSG_GET_BLOCK_RESULT,
 	NGNFS_MSG_WRITE_BLOCK,
 	NGNFS_MSG_WRITE_BLOCK_RESULT,
-	NGNFS_MSG_GET_MANIFEST,
-	NGNFS_MSG_GET_MANIFEST_RESULT,
+	NGNFS_MSG_GET_MAPS,
+	NGNFS_MSG_GET_MAPS_RESULT,
 	NGNFS_MSG__NR,
 };
 
@@ -64,11 +64,11 @@ struct ngnfs_msg_write_block_result {
 	__u8 _pad[7];
 };
 
-struct ngnfs_msg_get_manifest {
+struct ngnfs_msg_get_maps {
 	__le64 seq_nr;
 };
 
-struct ngnfs_msg_get_manifest_result {
+struct ngnfs_msg_get_maps_result {
 	__le64 seq_nr;
 	__u8 err;
 	__u8 _pad[7];

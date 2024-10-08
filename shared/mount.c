@@ -32,7 +32,7 @@
 #include "shared/trace.h"
 
 struct mount_options {
-	struct sockaddr_in manifest_server_addr;
+	struct sockaddr_in mapd_server_addr;
 	u8 nr_maddrs;
 	struct list_head devd_addr_list;
 	u8 nr_daddrs;
@@ -42,7 +42,7 @@ struct mount_options {
 static struct option_more mount_moreopts[] = {
 	{ .longopt = { "addr", required_argument, NULL, 'a' },
 	  .arg = "addr:port",
-	  .desc = "IPv4 address and port of manifest server to query", },
+	  .desc = "IPv4 address and port of mapd server to query", },
 
 	{ .longopt = { "devd_addr", required_argument, NULL, 'd' },
 	  .arg = "addr:port",
@@ -61,11 +61,11 @@ static int parse_mount_opt(int c, char *str, void *arg)
 
 	switch(c) {
 	case 'a':
-		ret = parse_ipv4_addr_port(&opts->manifest_server_addr, str);
+		ret = parse_ipv4_addr_port(&opts->mapd_server_addr, str);
 		opts->nr_maddrs = 1;
 		break;
 	case 'd':
-		ret = ngnfs_manifest_append_addr(&opts->nr_daddrs, &opts->devd_addr_list, str);
+		ret = ngnfs_map_append_addr(&opts->nr_daddrs, &opts->devd_addr_list, str);
 		break;
 	case 't':
 		ret = strdup_nerr(&opts->trace_path, str);
@@ -93,13 +93,13 @@ int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 
 	ret = trace_setup(opts.trace_path) ?:
 	      ngnfs_msg_setup(nfi, &ngnfs_mtr_socket_ops, NULL, NULL) ?:
-	      ngnfs_manifest_client_setup(nfi, &opts.manifest_server_addr, &opts.devd_addr_list, opts.nr_daddrs) ?:
+	      ngnfs_map_client_setup(nfi, &opts.mapd_server_addr, &opts.devd_addr_list, opts.nr_daddrs) ?:
 	      ngnfs_block_setup(nfi, &ngnfs_btr_msg_ops, NULL);
 out:
 	if (ret < 0)
 		ngnfs_unmount(nfi);
 
-	ngnfs_manifest_free_addrs(&opts.devd_addr_list);
+	ngnfs_map_free_addrs(&opts.devd_addr_list);
 
 	return ret;
 }
@@ -107,6 +107,6 @@ out:
 void ngnfs_unmount(struct ngnfs_fs_info *nfi)
 {
 	ngnfs_block_destroy(nfi);
-	ngnfs_manifest_client_destroy(nfi);
+	ngnfs_map_client_destroy(nfi);
 	ngnfs_msg_destroy(nfi);
 }

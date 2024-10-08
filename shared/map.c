@@ -30,33 +30,33 @@ struct ngnfs_devd_addrs {
 };
 
 /*
- * TODO: make the manifest contents an array with functions to fill/free
+ * TODO: make the map contents an array with functions to fill/free
  */
-struct ngnfs_manifest_contents {
+struct ngnfs_maps {
 	u64 seq_nr;
 	struct ngnfs_devd_addrs *devd_array;
 };
 
-struct ngnfs_manifest_info {
+struct ngnfs_map_info {
 	struct wait_queue_head updates_waitq;
 	struct mutex mutex;
-	struct ngnfs_manifest_contents *contents;
+	struct ngnfs_maps *maps;
 };
 
 /*
- * Structure for sending a manifest as a series of blocks via
- * ngnfs_msg_send. Currently we only send manifests that fit in a single block
- * but at some point it will be an array of blocks.
+ * Structure for sending maps as a series of blocks via
+ * ngnfs_msg_send. Currently we only send maps that fit in a single block but at
+ * some point it will be an array of blocks.
  */
-struct manifest_msg {
+struct maps_msg {
 	u64 seq_nr;
 	struct page *page;
 };
 
 /* Parse the IPv4 addr:port in str and add it to addr_list. */
-int ngnfs_manifest_append_addr(u8 *nr_addrs, struct list_head *addr_list, char *str)
+int ngnfs_map_append_addr(u8 *nr_addrs, struct list_head *addr_list, char *str)
 {
-	struct ngnfs_manifest_addr_head *ahead;
+	struct ngnfs_map_addr_head *ahead;
 	int ret;
 
 	if (*nr_addrs == U8_MAX) {
@@ -64,7 +64,7 @@ int ngnfs_manifest_append_addr(u8 *nr_addrs, struct list_head *addr_list, char *
 		return -EINVAL;
 	}
 
-	ahead = malloc(sizeof(struct ngnfs_manifest_addr_head));
+	ahead = malloc(sizeof(struct ngnfs_map_addr_head));
 	if (!ahead)
 		return -ENOMEM;
 
@@ -82,10 +82,10 @@ out:
 	return ret;
 }
 
-void ngnfs_manifest_free_addrs(struct list_head *addr_list)
+void ngnfs_map_free_addrs(struct list_head *addr_list)
 {
-	struct ngnfs_manifest_addr_head *ahead;
-	struct ngnfs_manifest_addr_head *tmp;
+	struct ngnfs_map_addr_head *ahead;
+	struct ngnfs_map_addr_head *tmp;
 
 	list_for_each_entry_safe(ahead, tmp, addr_list, head) {
 		list_del_init(&ahead->head);
@@ -99,41 +99,41 @@ static struct ngnfs_devd_addrs *alloc_devd_array(u8 nr)
 }
 
 /* Caller must already have excluded other RCU readers. */
-static void manifest_contents_destroy(struct ngnfs_manifest_contents *mfc)
+static void maps_destroy(struct ngnfs_maps *maps)
 {
-	if (mfc)
-		kfree(mfc->devd_array);
-	kfree(mfc);
+	if (maps)
+		kfree(maps->devd_array);
+	kfree(maps);
 }
 
-static void update_manifest_contents(struct ngnfs_fs_info *nfi, struct ngnfs_manifest_contents *new_mfc)
+static void update_maps(struct ngnfs_fs_info *nfi, struct ngnfs_maps *new_maps)
 {
-	struct ngnfs_manifest_info *mfinf = nfi->manifest_info;
-	struct ngnfs_manifest_contents *old_mfc;
+	struct ngnfs_map_info *minf = nfi->map_info;
+	struct ngnfs_maps *old_maps;
 
-	mutex_lock(&mfinf->mutex);
-	old_mfc = mfinf->contents;
-	rcu_assign_pointer(mfinf->contents, new_mfc);
-	mutex_unlock(&mfinf->mutex);
+	mutex_lock(&minf->mutex);
+	old_maps = minf->maps;
+	rcu_assign_pointer(minf->maps, new_maps);
+	mutex_unlock(&minf->mutex);
 
-	wake_up(&mfinf->updates_waitq);
+	wake_up(&minf->updates_waitq);
 
 	synchronize_rcu();
-	manifest_contents_destroy(old_mfc);
+	maps_destroy(old_maps);
 }
 
 /*
- * Caller is responsible for noticing if the manifest info has changed and
- * restarting the transaction.
+ * Caller is responsible for noticing if the maps have changed and restarting
+ * the transaction. TODO: how?
  */
-int ngnfs_manifest_map_block(struct ngnfs_fs_info *nfi, u64 bnr, struct sockaddr_in *addr)
+int ngnfs_map_map_block(struct ngnfs_fs_info *nfi, u64 bnr, struct sockaddr_in *addr)
 {
 	struct ngnfs_devd_addrs *da;
 	u32 rem;
 
 	rcu_read_lock();
 
-	da = rcu_dereference(nfi->manifest_info->contents)->devd_array;
+	da = rcu_dereference(nfi->map_info->maps)->devd_array;
 	div_u64_rem(bnr, da->nr_addrs, &rem);
 	*addr = da->addrs[rem];
 
@@ -142,10 +142,10 @@ int ngnfs_manifest_map_block(struct ngnfs_fs_info *nfi, u64 bnr, struct sockaddr
 	return 0;
 }
 
-/* Marshal from memory to network representation of manifest. */
-static int manifest_marshal(struct ngnfs_manifest_contents *mfc, void *dst, u16 size)
+/* Marshal maps from memory to network representation. */
+static int marshal_maps(struct ngnfs_maps *maps, void *dst, u16 size)
 {
-	struct ngnfs_devd_addrs *da = mfc->devd_array;
+	struct ngnfs_devd_addrs *da = maps->devd_array;
 	u8 nr = da->nr_addrs;
 	int i;
 
@@ -160,8 +160,8 @@ static int manifest_marshal(struct ngnfs_manifest_contents *mfc, void *dst, u16 
 	return 0;
 }
 
-/* Unmarshal from network to memory representation of manifest. */
-static int manifest_unmarshal(struct ngnfs_manifest_contents *mfc, void *src, u16 size)
+/* Unmarshal maps from network to memory representation. */
+static int unmarshal_maps(struct ngnfs_maps *maps, void *src, u16 size)
 {
 	struct ngnfs_devd_addrs *da;
 	u8 nr;
@@ -183,133 +183,133 @@ static int manifest_unmarshal(struct ngnfs_manifest_contents *mfc, void *src, u1
 		memcpy(&da->addrs[i], src, sizeof(da->addrs[i]));
 		src += sizeof(da->addrs[i]);
 	}
-	mfc->devd_array = da;
+	maps->devd_array = da;
 
 	ret = 0;
 out:
 	if (ret < 0)
-		manifest_contents_destroy(mfc);
+		maps_destroy(maps);
 	return ret;
 }
 
-static int manifest_msg_to_contents(struct ngnfs_fs_info *nfi, u64 seq_nr, void *data, u16 size)
+static int msg_to_maps(struct ngnfs_fs_info *nfi, u64 seq_nr, void *data, u16 size)
 {
-	struct ngnfs_manifest_contents *mfc;
+	struct ngnfs_maps *maps;
 	int ret;
 
-	mfc = kzalloc(sizeof(struct ngnfs_manifest_contents), GFP_NOFS);
-	if (!mfc)
+	maps = kzalloc(sizeof(struct ngnfs_maps), GFP_NOFS);
+	if (!maps)
 		return -ENOMEM;
 
-	ret = manifest_unmarshal(mfc, data, size);
+	ret = unmarshal_maps(maps, data, size);
 	if (ret < 0)
 		goto out;
 
-	mfc->seq_nr = seq_nr;
-	update_manifest_contents(nfi, mfc);
+	maps->seq_nr = seq_nr;
+	update_maps(nfi, maps);
 out:
 	if (ret < 0) {
-		kfree(mfc);
+		kfree(maps);
 	}
 	return ret;
 }
 
-static struct manifest_msg *manifest_alloc_msg(u16 size)
+static struct maps_msg *alloc_maps_msg(u16 size)
 {
-	struct manifest_msg *mfm;
+	struct maps_msg *mm;
 
 	BUG_ON(size > NGNFS_BLOCK_SIZE);
 
-	mfm = kzalloc(sizeof(struct manifest_msg), GFP_NOFS);
-	if (!mfm)
+	mm = kzalloc(sizeof(struct maps_msg), GFP_NOFS);
+	if (!mm)
 		return ERR_PTR(-ENOMEM);
 
-	mfm->page = alloc_page(GFP_NOFS);
+	mm->page = alloc_page(GFP_NOFS);
 
-	if (!mfm->page) {
-		kfree(mfm);
-		mfm = ERR_PTR(-ENOMEM);
+	if (!mm->page) {
+		kfree(mm);
+		mm = ERR_PTR(-ENOMEM);
 	}
-	return mfm;
+	return mm;
 }
 
-static void manifest_free_msg(struct manifest_msg *mfm)
+static void free_maps_msg(struct maps_msg *mm)
 {
-	put_page(mfm->page);
-	kfree(mfm);
+	put_page(mm->page);
+	kfree(mm);
 }
 
-static struct page *manifest_msg_to_page(struct manifest_msg *mfm)
+static struct page *maps_msg_to_page(struct maps_msg *mm)
 {
-	return mfm->page;
+	return mm->page;
 }
 
-static struct manifest_msg *manifest_contents_to_msg(struct ngnfs_fs_info *nfi)
+static struct maps_msg *maps_to_maps_msg(struct ngnfs_fs_info *nfi)
 {
-	struct ngnfs_manifest_info *mfinf = nfi->manifest_info;
-	struct ngnfs_manifest_contents *mfc;
-	struct manifest_msg *mfm;
+	struct ngnfs_map_info *minf = nfi->map_info;
+	struct ngnfs_maps *maps;
+	struct maps_msg *mm;
 	u64 seq_nr;
 	u8 nr;
 	int ret;
 
 	/*
-	 * The size of the manifest contents can change between reading it and
-	 * allocating the memory but we can't allocate while holding the RCU read
-	 * lock. Just retry if that happens.
+	 * The maps (and their size) can change between reading it and allocating
+	 * the memory but we can't allocate while holding the RCU read lock. Just
+	 * retry if that happens.
 	 */
 retry:
 	rcu_read_lock();
-	mfc = rcu_dereference(mfinf->contents);
-	seq_nr = mfc->seq_nr;
-	nr = mfc->devd_array->nr_addrs;
+	maps = rcu_dereference(minf->maps);
+	seq_nr = maps->seq_nr;
+	nr = maps->devd_array->nr_addrs;
 	rcu_read_unlock();
 
-	mfm = manifest_alloc_msg(offsetof(struct ngnfs_devd_addrs, addrs[nr]));
-	if (!mfm)
+	mm = alloc_maps_msg(offsetof(struct ngnfs_devd_addrs, addrs[nr]));
+	if (!mm)
 		return ERR_PTR(-ENOMEM);
 
 	rcu_read_lock();
-	mfc = rcu_dereference(mfinf->contents);
-	if (seq_nr != mfc->seq_nr) {
-		manifest_free_msg(mfm);
+	maps = rcu_dereference(minf->maps);
+	if (seq_nr != maps->seq_nr) {
+		free_maps_msg(mm);
 		rcu_read_unlock();
 		goto retry;
 	}
 
-	ret = manifest_marshal(mfc, page_address(mfm->page), NGNFS_BLOCK_SIZE);
+	ret = marshal_maps(maps, page_address(mm->page), NGNFS_BLOCK_SIZE);
 	rcu_read_unlock();
 
-	mfm->seq_nr = seq_nr;
+	mm->seq_nr = seq_nr;
 
 	if (ret < 0) {
-		manifest_free_msg(mfm);
-		mfm = ERR_PTR(-ENOMEM);
+		free_maps_msg(mm);
+		mm = ERR_PTR(-ENOMEM);
 	}
-	return mfm;
+	return mm;
 }
 
-static int manifest_get_manifest(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
+static int map_get_maps(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
 {
-	struct ngnfs_msg_get_manifest_result res;
+	struct ngnfs_msg_get_maps_result res;
 	struct ngnfs_msg_desc res_mdesc;
-	struct manifest_msg *mfm;
+	struct maps_msg *mm;
 	int ret;
 
 	/* XXX permissions? other checks? */
-	if ((mdesc->ctl_size != sizeof(struct ngnfs_msg_get_manifest)))
+	if ((mdesc->ctl_size != sizeof(struct ngnfs_msg_get_maps)))
 		return -EINVAL;
 
-	mfm = manifest_contents_to_msg(nfi);
-	if (IS_ERR(mfm))
-		ret = PTR_ERR(mfm);
+	mm = maps_to_maps_msg(nfi);
+	if (IS_ERR(mm))
+		ret = PTR_ERR(mm);
 	else
 		ret = 0;
 
-	res.seq_nr = mfm->seq_nr;
+	res.seq_nr = mm->seq_nr;
 	res.err = ngnfs_msg_err(ret);
 
-	res_mdesc.type = NGNFS_MSG_GET_MANIFEST_RESULT;
+	res_mdesc.type = NGNFS_MSG_GET_MAPS_RESULT;
 	res_mdesc.addr = mdesc->addr;
 	res_mdesc.ctl_buf = &res;
 	res_mdesc.ctl_size = sizeof(res);
@@ -317,50 +317,50 @@ static int manifest_get_manifest(struct ngnfs_fs_info *nfi, struct ngnfs_msg_des
 		res_mdesc.data_page = NULL;
 		res_mdesc.data_size = 0;
 	} else {
-		res_mdesc.data_page = manifest_msg_to_page(mfm);
+		res_mdesc.data_page = maps_msg_to_page(mm);
 		res_mdesc.data_size = NGNFS_BLOCK_SIZE;
 	}
 
 	ret = ngnfs_msg_send(nfi, &res_mdesc);
-	manifest_free_msg(mfm);
+	free_maps_msg(mm);
 
 	return ret;
 }
 
-/* Returns true when there is a new manifest than seq_nr. */
-static int is_newer_manifest(struct ngnfs_manifest_info *mfinf, u64 old_seq_nr)
+/* Returns true when the caller's maps are newer than the maps with id seq_nr. */
+static int maps_updated(struct ngnfs_map_info *minf, u64 old_seq_nr)
 {
 	u64 new_seq_nr = 0;
 
 	rcu_read_lock();
-	if (mfinf->contents)
-		new_seq_nr = rcu_dereference(mfinf->contents)->seq_nr;
+	if (minf->maps)
+		new_seq_nr = rcu_dereference(minf->maps)->seq_nr;
 	rcu_read_unlock();
 
 	return (new_seq_nr > old_seq_nr);
 }
 
 /*
- * Request manifest contents from addr and wait until an update is received.
+ * Request maps from mapd server at addr and wait until an update is received.
  */
-int ngnfs_manifest_request(struct ngnfs_fs_info *nfi, struct sockaddr_in *addr)
+int ngnfs_maps_request(struct ngnfs_fs_info *nfi, struct sockaddr_in *addr)
 {
-	struct ngnfs_manifest_info *mfinf = nfi->manifest_info;
-	struct ngnfs_msg_get_manifest gm;
+	struct ngnfs_map_info *minf = nfi->map_info;
+	struct ngnfs_msg_get_maps gm;
 	struct ngnfs_msg_desc mdesc;
 	u64 seq_nr;
 	int ret;
 
 	seq_nr = 0;
-	if (mfinf->contents) {
+	if (minf->maps) {
 		rcu_read_lock();
-		seq_nr = rcu_dereference(mfinf->contents)->seq_nr;
+		seq_nr = rcu_dereference(minf->maps)->seq_nr;
 		rcu_read_unlock();
 	}
 
 	gm.seq_nr = cpu_to_le64(seq_nr);
 
-	mdesc.type = NGNFS_MSG_GET_MANIFEST;
+	mdesc.type = NGNFS_MSG_GET_MAPS;
 	mdesc.addr = addr;
 	mdesc.ctl_buf = &gm;
 	mdesc.ctl_size = sizeof(gm);
@@ -369,16 +369,16 @@ int ngnfs_manifest_request(struct ngnfs_fs_info *nfi, struct sockaddr_in *addr)
 
 	ret = ngnfs_msg_send(nfi, &mdesc);
 
-	wait_event(&mfinf->updates_waitq, is_newer_manifest(mfinf, seq_nr));
+	wait_event(&minf->updates_waitq, maps_updated(minf, seq_nr));
 
 	return ret;
 }
 
-static int manifest_get_manifest_result(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
+static int map_get_maps_result(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
 {
-	struct ngnfs_msg_get_manifest_result *gmr = mdesc->ctl_buf;
+	struct ngnfs_msg_get_maps_result *gmr = mdesc->ctl_buf;
 
-	if (mdesc->ctl_size != sizeof(struct ngnfs_msg_get_manifest_result) ||
+	if (mdesc->ctl_size != sizeof(struct ngnfs_msg_get_maps_result) ||
 	    ((gmr->err == NGNFS_MSG_ERR_OK) && (mdesc->data_size != NGNFS_BLOCK_SIZE)) ||
 	    ((gmr->err != NGNFS_MSG_ERR_OK) && (mdesc->data_size != 0)))
 		return -EINVAL;
@@ -386,7 +386,7 @@ static int manifest_get_manifest_result(struct ngnfs_fs_info *nfi, struct ngnfs_
 	if (gmr->err < 0)
 		return ngnfs_msg_err(gmr->err);
 
-	return manifest_msg_to_contents(nfi, le64_to_cpu(gmr->seq_nr), page_address(mdesc->data_page), mdesc->data_size);
+	return msg_to_maps(nfi, le64_to_cpu(gmr->seq_nr), page_address(mdesc->data_page), mdesc->data_size);
 }
 
 /*
@@ -399,7 +399,7 @@ static int manifest_get_manifest_result(struct ngnfs_fs_info *nfi, struct ngnfs_
  */
 static struct ngnfs_devd_addrs *list_to_addr_array(struct list_head *list, u8 nr)
 {
-	struct ngnfs_manifest_addr_head *ahead;
+	struct ngnfs_map_addr_head *ahead;
 	struct ngnfs_devd_addrs *da;
 	struct sockaddr_in *addr;
 	int ret;
@@ -440,35 +440,35 @@ out:
 }
 
 /*
- * Can only be called when there are no users of the manifest running, such as
- * the block layer and the manifest message handlers.
+ * Can only be called when there are no users of the maps running, such as
+ * the block layer and the map message handlers.
  */
-static void manifest_info_destroy(struct ngnfs_fs_info *nfi)
+static void map_info_destroy(struct ngnfs_fs_info *nfi)
 {
-	struct ngnfs_manifest_info *mfinf = nfi->manifest_info;
+	struct ngnfs_map_info *minf = nfi->map_info;
 
-	if (mfinf) {
-		if (mfinf->contents) {
-			manifest_contents_destroy(mfinf->contents);
-			mfinf->contents = NULL;
+	if (minf) {
+		if (minf->maps) {
+			maps_destroy(minf->maps);
+			minf->maps = NULL;
 		}
-		kfree(mfinf);
-		nfi->manifest_info = NULL;
+		kfree(minf);
+		nfi->map_info = NULL;
 	}
 }
 
-static int manifest_contents_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr)
+static int maps_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr)
 {
-	struct ngnfs_manifest_info *mfinf = nfi->manifest_info;
-	struct ngnfs_manifest_contents *mfc;
+	struct ngnfs_map_info *minf = nfi->map_info;
+	struct ngnfs_maps *maps;
 	struct ngnfs_devd_addrs *da;
 	int ret;
 
 	if (nr == 0)
 		return -EINVAL;
 
-	mfc = kzalloc(sizeof(struct ngnfs_manifest_contents), GFP_NOFS);
-	if (!mfc) {
+	maps = kzalloc(sizeof(struct ngnfs_maps), GFP_NOFS);
+	if (!maps) {
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -479,103 +479,102 @@ static int manifest_contents_setup(struct ngnfs_fs_info *nfi, struct list_head *
 		goto out;
 	}
 
-	mfc->devd_array = da;
-	mfinf->contents = mfc;
+	maps->devd_array = da;
+	minf->maps = maps;
 
 	ret = 0;
 out:
 	if (ret < 0)
-		kfree(mfc);
+		kfree(maps);
 	return ret;
 }
 
-static int manifest_info_setup(struct ngnfs_fs_info *nfi)
+static int map_info_setup(struct ngnfs_fs_info *nfi)
 {
-	struct ngnfs_manifest_info *mfinf;
+	struct ngnfs_map_info *minf;
 	int ret;
 
-	mfinf = kzalloc(sizeof(struct ngnfs_manifest_info), GFP_NOFS);
-	if (!mfinf) {
+	minf = kzalloc(sizeof(struct ngnfs_map_info), GFP_NOFS);
+	if (!minf) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	mutex_init(&mfinf->mutex);
-	init_waitqueue_head(&mfinf->updates_waitq);
-	nfi->manifest_info = mfinf;
+	mutex_init(&minf->mutex);
+	init_waitqueue_head(&minf->updates_waitq);
+	nfi->map_info = minf;
 
 	ret = 0;
 out:
 	if (ret < 0)
-		manifest_info_destroy(nfi);
+		map_info_destroy(nfi);
 	return ret;
 }
 
-void ngnfs_manifest_client_destroy(struct ngnfs_fs_info *nfi)
+void ngnfs_map_client_destroy(struct ngnfs_fs_info *nfi)
 {
-	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_MANIFEST, manifest_get_manifest_result);
-	manifest_info_destroy(nfi);
+	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_MAPS, map_get_maps_result);
+	map_info_destroy(nfi);
 }
 
-int ngnfs_manifest_client_setup(struct ngnfs_fs_info *nfi, struct sockaddr_in *manifest_server_addr, struct list_head *list, u8 nr)
+int ngnfs_map_client_setup(struct ngnfs_fs_info *nfi, struct sockaddr_in *mapd_server_addr, struct list_head *list, u8 nr)
 {
 	int ret;
 
 	/*
-	 * For the client, we want to register to receive manifest results before we
-	 * set up the manifest info.
+	 * For the client, we want to register to receive map messages before we set
+	 * up the map info, since we may request it from a mapd server.
 	 */
-	ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_GET_MANIFEST_RESULT, manifest_get_manifest_result);
+	ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_GET_MAPS_RESULT, map_get_maps_result);
 	if (ret < 0)
 		return ret;
 
-	ret = manifest_info_setup(nfi);
+	ret = map_info_setup(nfi);
 	if (ret < 0)
 		goto out;
 
 	/*
-	 * Only ask for a manifest from the manifest server if no devices are
-	 * specified on the command line. Presumably the user has good reason to
-	 * force that.
+	 * Only ask for maps from the mapd server if no maps are specified on the
+	 * command line. Presumably the user has good reason to force that.
 	 */
 	if (nr != 0)
-		ret = manifest_contents_setup(nfi, list, nr);
+		ret = maps_setup(nfi, list, nr);
 	else
-		ret = ngnfs_manifest_request(nfi, manifest_server_addr);
+		ret = ngnfs_maps_request(nfi, mapd_server_addr);
 out:
 	if (ret < 0)
-		ngnfs_manifest_client_destroy(nfi);
+		ngnfs_map_client_destroy(nfi);
 	return ret;
 }
 
-void ngnfs_manifest_server_destroy(struct ngnfs_fs_info *nfi)
+void ngnfs_map_server_destroy(struct ngnfs_fs_info *nfi)
 {
-	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_MANIFEST, manifest_get_manifest);
-	manifest_info_destroy(nfi);
+	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_MAPS, map_get_maps);
+	map_info_destroy(nfi);
 }
 
-int ngnfs_manifest_server_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr)
+int ngnfs_map_server_setup(struct ngnfs_fs_info *nfi, struct list_head *list, u8 nr)
 {
 	int ret;
 
 	/*
-	 * For the server, we want the manifest info setup before we register to
-	 * accept messages to serve it.
+	 * For the server, we want the maps set up before we register to accept
+	 * messages to serve them.
 	 */
-	ret = manifest_info_setup(nfi);
+	ret = map_info_setup(nfi);
 	if (ret < 0)
 		return ret;
 
-	ret = manifest_contents_setup(nfi, list, nr);
+	ret = maps_setup(nfi, list, nr);
 	if (ret < 0)
 		goto out;
 
 	/* TODO: load the sequence number from persistent storage. */
-	nfi->manifest_info->contents->seq_nr = 1;
+	nfi->map_info->maps->seq_nr = 1;
 
-	ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_GET_MANIFEST, manifest_get_manifest);
+	ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_GET_MAPS, map_get_maps);
 out:
 	if (ret < 0)
-		ngnfs_manifest_server_destroy(nfi);
+		ngnfs_map_server_destroy(nfi);
 	return ret;
 }

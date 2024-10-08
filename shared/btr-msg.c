@@ -82,7 +82,7 @@ static int ngnfs_btr_msg_submit_block(struct ngnfs_fs_info *nfi, void *btr_info,
 			goto out;
 	}
 
-	ret = ngnfs_manifest_map_block(nfi, bnr, &addr);
+	ret = ngnfs_map_map_block(nfi, bnr, &addr);
 	if (ret == 0) {
 		mdesc.addr = &addr;
 		ret = ngnfs_msg_send(nfi, &mdesc);
