@@ -19,7 +19,7 @@
 #include "shared/fs_info.h"
 #include "shared/lk/wait.h"
 #include "shared/log.h"
-#include "shared/manifest.h"
+#include "shared/map.h"
 #include "shared/msg.h"
 #include "shared/parse.h"
 #include "shared/urcu.h"

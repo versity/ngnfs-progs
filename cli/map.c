@@ -16,7 +16,7 @@
 
 #include "shared/fs_info.h"
 #include "shared/log.h"
-#include "shared/manifest.h"
+#include "shared/map.h"
 #include "shared/msg.h"
 #include "shared/mtr-socket.h"
 #include "shared/nerr.h"

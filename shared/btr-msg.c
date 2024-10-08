@@ -9,7 +9,7 @@
 #include "shared/btr-msg.h"
 #include "shared/format-block.h"
 #include "shared/fs_info.h"
-#include "shared/manifest.h"
+#include "shared/map.h"
 #include "shared/msg.h"
 
 static int ngnfs_btr_msg_get_block_result(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)

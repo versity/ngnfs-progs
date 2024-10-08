@@ -22,7 +22,7 @@
 #include "shared/block.h"
 #include "shared/btr-msg.h"
 #include "shared/log.h"
-#include "shared/manifest.h"
+#include "shared/map.h"
 #include "shared/mount.h"
 #include "shared/msg.h"
 #include "shared/mtr-socket.h"
