@@ -9,7 +9,7 @@
 #include "shared/btr-msg.h"
 #include "shared/format-block.h"
 #include "shared/fs_info.h"
-#include "shared/manifest.h"
+#include "shared/map.h"
 #include "shared/msg.h"
 
 static int ngnfs_btr_msg_get_block_result(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
@@ -82,7 +82,7 @@ static int ngnfs_btr_msg_submit_block(struct ngnfs_fs_info *nfi, void *btr_info,
 			goto out;
 	}
 
-	ret = ngnfs_manifest_map_block(nfi, bnr, &addr);
+	ret = ngnfs_map_map_block(nfi, bnr, &addr);
 	if (ret == 0) {
 		mdesc.addr = &addr;
 		ret = ngnfs_msg_send(nfi, &mdesc);
