@@ -8,11 +8,13 @@
  */
 struct ngnfs_block_info;
 struct ngnfs_manifest_info;
+struct ngnfs_map_info;
 struct ngnfs_msg_info;
 
 struct ngnfs_fs_info {
 	struct ngnfs_block_info *block_info;
 	struct ngnfs_manifest_info *manifest_info;
+	struct ngnfs_map_info *map_info;
 	struct ngnfs_msg_info *msg_info;
 };
 
