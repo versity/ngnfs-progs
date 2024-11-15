@@ -209,7 +209,6 @@ static int debugfs_func(int argc, char **argv)
 	ret = thread_start(&thr, debugfs_thread, &dargs) ?:
 	      thread_sigwait();
 
-	thread_stop_indicate(&thr);
 	thread_stop_wait(&thr);
 
 out:
