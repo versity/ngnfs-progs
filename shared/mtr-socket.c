@@ -270,7 +270,7 @@ static void socket_connect_thread(struct thread *thr, void *arg)
 
 	ret = connect(fd, (struct sockaddr *)&pinf->addr, sizeof(pinf->addr));
 	if (ret < 0) {
-		ret = -ret;
+		ret = -errno;
 		log("error creating send thread: "ENOF, ENOA(-ret));
 		goto out;
 	}
