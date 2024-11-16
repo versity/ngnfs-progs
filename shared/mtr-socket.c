@@ -59,6 +59,7 @@ static void shutdown_peer(struct socket_peer_info *pinf, int err)
 		thread_stop_indicate(&pinf->recv_thr);
 		if (pinf->fd >= 0)
 			shutdown(pinf->fd, SHUT_RDWR);
+		wake_up(&pinf->waitq);
 	}
 
 	/* don't really mind if this races */
@@ -351,6 +352,8 @@ static void socket_destroy_peer(void *info)
 
 	thread_stop_wait(&pinf->connect_thr);
 	thread_stop_wait(&pinf->listen_thr);
+	thread_stop_indicate(&pinf->send_thr);
+	wake_up(&pinf->waitq);
 	thread_stop_wait(&pinf->send_thr);
 	thread_stop_wait(&pinf->recv_thr);
 
