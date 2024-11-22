@@ -21,6 +21,7 @@ int ngnfs_map_setup(struct ngnfs_fs_info *nfi);
 void ngnfs_map_destroy(struct ngnfs_fs_info *nfi);
 
 int ngnfs_map_client_setup(struct ngnfs_fs_info *nfi, struct sockaddr_in *mapd_server_addr);
+void ngnfs_map_client_shutdown(struct ngnfs_fs_info *nfi);
 void ngnfs_map_client_destroy(struct ngnfs_fs_info *nfi);
 
 #endif

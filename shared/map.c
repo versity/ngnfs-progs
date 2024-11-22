@@ -17,6 +17,7 @@
 #include "shared/log.h"
 #include "shared/map.h"
 #include "shared/msg.h"
+#include "shared/shutdown.h"
 
 /*
  * The maps are updated using RCU. Add an RCU wrapper for the maps
@@ -168,7 +169,10 @@ int ngnfs_map_get_maps(struct ngnfs_fs_info *nfi)
 	if (ret < 0)
 		return ret;
 
-	wait_event(&minf->waitq, (minf->maps_rcu != NULL));
+	wait_event(&minf->waitq, ((minf->maps_rcu != NULL) || ngnfs_should_shutdown(nfi)));
+
+	if (ngnfs_should_shutdown(nfi))
+		ret = -ESHUTDOWN;
 
 	return ret;
 }
@@ -213,6 +217,14 @@ static int map_get_maps_result(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc 
 	wake_up(&nfi->map_info->waitq);
 
 	return ret;
+}
+
+void ngnfs_map_client_shutdown(struct ngnfs_fs_info *nfi)
+{
+	struct ngnfs_map_info *minf = nfi->map_info;
+
+	if (minf)
+		wake_up(&nfi->map_info->waitq);
 }
 
 void ngnfs_map_destroy(struct ngnfs_fs_info *nfi)

@@ -2,6 +2,8 @@
 #ifndef NGNFS_SHARED_FS_INFO_H
 #define NGNFS_SHARED_FS_INFO_H
 
+#include <stdbool.h>
+
 /*
  * The _fs_info struct is the global system context reference.  Each layer has its
  * info per-system info stored here.
@@ -14,6 +16,8 @@ struct ngnfs_fs_info {
 	struct ngnfs_block_info *block_info;
 	struct ngnfs_map_info *map_info;
 	struct ngnfs_msg_info *msg_info;
+	int global_errno; /* okay to race */
+	bool shutdown;
 };
 
 #define INIT_NGNFS_FS_INFO { NULL, }

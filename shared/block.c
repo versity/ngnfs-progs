@@ -32,6 +32,7 @@
 #include "shared/lk/bitops.h"
 #include "shared/lk/bug.h"
 #include "shared/lk/build_bug.h"
+#include "shared/lk/container_of.h"
 #include "shared/lk/cmpxchg.h"
 #include "shared/lk/err.h"
 #include "shared/lk/errno.h"
@@ -1076,6 +1077,41 @@ static void free_ht_block(void *ptr, void *arg)
 
 	/* XXX make sure this makes sense */
 	put_block(bl);
+}
+
+static inline void *head_to_obj(struct rhash_head *head, const struct rhashtable_params *params)
+{
+	return head ? ((void *)head - params->head_offset) : NULL;
+}
+
+/*
+ * Wake anyone waiting on work which will not be completed.
+ */
+void ngnfs_block_shutdown(struct ngnfs_fs_info *nfi)
+{
+	struct ngnfs_block_info *blinf = nfi->block_info;
+	struct cds_lfht_iter iter;
+	struct rhash_head *head;
+	struct ngnfs_block *bl;
+
+	if (!blinf)
+		return;
+
+	if (blinf->btr_ops->shutdown)
+		blinf->btr_ops->shutdown(nfi, blinf->btr_info);
+
+	/* Now mark every outstanding IO as an error and complete it */
+	cds_lfht_for_each_entry(blinf->ht.lfht, &iter, head, node) {
+		bl = (head_to_obj(head, &blinf->ht.params));
+		set_bit(BL_ERROR, &bl->bits);
+		bl->error = -ESHUTDOWN;
+		sync_waiters_set_error(blinf);
+
+		if (test_bit(BL_READING, &bl->bits))
+			end_read_io(blinf, bl, NULL);
+		if (test_bit(BL_DIRTY, &bl->bits))
+			end_write_io(blinf, bl);
+	}
 }
 
 /*
