@@ -51,6 +51,11 @@ static int cmd_mkfs(struct debugfs_context *ctx, int argc, char **argv)
 	return ret;
 }
 
+static int cmd_quit(struct debugfs_context *ctx, int argc, char **argv)
+{
+	return 1;
+}
+
 static int cmd_stat(struct debugfs_context *ctx, int argc, char **argv)
 {
 	struct ngnfs_transaction txn = INIT_NGNFS_TXN(txn);
@@ -90,6 +95,7 @@ static struct command {
 	int (*func)(struct debugfs_context *ctx, int argc, char **argv);
 } commands[] = {
 	{ "mkfs", cmd_mkfs, },
+	{ "quit", cmd_quit, },
 	{ "stat", cmd_stat, },
 };
 
@@ -227,6 +233,10 @@ static void debugfs_thread(struct thread *thr, void *arg)
 			break;
 
 		ret = parse_run_command(ctx, line, line_argv);
+		if (ret == 1) { /* quit requested */
+			ret = 0;
+			break;
+		}
 	}
 
 	dargs->ret = ret;
