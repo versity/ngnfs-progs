@@ -25,5 +25,6 @@ int thread_start(struct thread *thr, thread_fn_t fn, void *arg);
 bool thread_should_return(struct thread *thr);
 void thread_stop_indicate(struct thread *thr);
 void thread_stop_wait(struct thread *thr);
+void thread_shutdown_all(void);
 
 #endif
