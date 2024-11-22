@@ -27,8 +27,7 @@ static void workqueue_thread(struct thread *thr, void *arg)
 	struct cds_wfcq_node *node;
 	struct work_struct *work;
 
-	while (!thread_should_return(thr)) {
-
+	for (;;) {
 		wait_event(&wq->waitq, !cds_wfcq_empty(&wq->head, &wq->tail) ||
 			   thread_should_return(thr));
 
