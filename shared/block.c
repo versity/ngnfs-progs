@@ -438,6 +438,8 @@ static void end_write_io(struct ngnfs_block_info *blinf, struct ngnfs_block *bl)
 	/* XXX not supporting write errors yet (keeping blocks dirty) */
 	BUG_ON(test_bit(BL_ERROR, &bl->bits));
 
+	clear_bit(BL_DIRTY, &bl->bits);
+
 	/* each finished block gives room for more writeback in the queue depth */
 	atomic_dec(&blinf->nr_writeback);
 	try_queue_writeback_work(blinf);
