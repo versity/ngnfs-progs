@@ -53,6 +53,7 @@ int ngnfs_block_sync(struct ngnfs_fs_info *nfi);
 
 void ngnfs_block_end_io(struct ngnfs_fs_info *nfi, u64 bnr, struct page *data_page, int err);
 
+void ngnfs_block_shutdown(struct ngnfs_fs_info *nfi);
 int ngnfs_block_setup(struct ngnfs_fs_info *nfi, struct ngnfs_block_transport_ops *btr_ops,
 		      void *btr_setup_arg);
 void ngnfs_block_destroy(struct ngnfs_fs_info *nfi);
