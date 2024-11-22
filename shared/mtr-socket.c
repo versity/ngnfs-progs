@@ -16,6 +16,7 @@
 #include "shared/log.h"
 #include "shared/msg.h"
 #include "shared/mtr-socket.h"
+#include "shared/shutdown.h"
 #include "shared/thread.h"
 
 /*
@@ -287,8 +288,10 @@ static void socket_connect_thread(struct thread *thr, void *arg)
 out:
 	if (fd >= 0)
 		close(fd);
-	if (ret < 0)
+	if (ret < 0) {
 		shutdown_peer(pinf, ret);
+		ngnfs_shutdown(pinf->nfi, ret);
+	}
 }
 
 static void socket_listen_thread(struct thread *thr, void *arg)
