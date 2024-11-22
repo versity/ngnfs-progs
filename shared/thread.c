@@ -95,6 +95,9 @@ int thread_sigwait(void)
 			break;
 		}
 
+		if (sig == SIGUSR1) /* orderly shutdown requested */
+			break;
+
 		printf("got signal %u, exiting\n", sig);
 		trace_flush();
 		exit(1);
@@ -158,4 +161,9 @@ void thread_stop_wait(struct thread *thr)
 		ret = pthread_join(thr->pthread, NULL);
 		assert(ret == 0);
 	}
+}
+
+void thread_shutdown_all(void)
+{
+	kill(getpid(), SIGUSR1);
 }
