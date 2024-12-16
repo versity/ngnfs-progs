@@ -25,11 +25,15 @@ BIN := $(patsubst %.c,%,$(shell grep -l "^int main" $(SRC)))
 # binary names have ngnfs- prefixed
 #binname = $(dir $1)ngnfs-$(notdir $1)
 
-# check exposed format structs by building compiled headers with -Wpadded
-GCH := $(patsubst %,%.gch,$(wildcard shared/format-*.h))
+#
+# check persistent fixed header structs for internal padding with
+# specific minimal compilation that avoids pulling in lots of header
+# dependencies that tend to trigger false positives.
+#
+PADCHECK := $(patsubst %.h,%.o.padcheck,$(wildcard shared/format-*.h))
 
 .PHONY: all
-all: shared/generated-trace-inlines.h $(GCH) $(BIN)
+all: shared/generated-trace-inlines.h $(PADCHECK) $(BIN)
 
 ifneq ($(DEP),)
 -include $(DEP)
@@ -49,7 +53,7 @@ $(BIN): %: %.o 	$$(filter $$(dir %)$$(PERCENT),$$(OBJ)) \
 	gcc $(CFLAGS) -MD -MP -MF $*.d -c $< -o $*.o
 	./scripts/sparse.sh -Wbitwise -D__CHECKER__ $(CFLAGS) $<
 
-$(GCH): %.h.gch: %.h Makefile
+$(PADCHECK): %.o.padcheck: %.h Makefile
 	gcc $(CFLAGS) -Wpadded -c $< -o $@
 
 shared/generated-trace-inlines.h: scripts/generate-trace-events.awk \
@@ -58,7 +62,7 @@ shared/generated-trace-inlines.h: scripts/generate-trace-events.awk \
 
 .PHONY: clean
 clean:
-	@rm -f $(BIN) $(OBJ) $(DEP) $(GCH) \
+	@rm -f $(BIN) $(OBJ) $(DEP) $(PADCHECK) \
 		$(foreach d,$(DIR),$(wildcard $(d)/*.[is])) \
 		shared/generated-trace-inlines.h \
 		.sparse.gcc-defines.h .sparse.output
