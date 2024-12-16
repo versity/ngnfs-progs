@@ -9,6 +9,27 @@
 #define NGNFS_BLOCK_SHIFT	12
 #define NGNFS_BLOCK_SIZE	(1 << NGNFS_BLOCK_SHIFT)
 
+struct ngnfs_rbt_root {
+	__u8 __pad[6];
+	__le16 node;
+};
+
+/*
+ * The high bit of _red_parent is used to store whether the node is red.
+ * It isn't exported because parent traversal is handled by the library
+ * calls.  Searching, including for insertion, callers do need to
+ * traverse children while comparing keys.
+ */
+struct ngnfs_rbt_node {
+	__le16 _red_parent;
+	__le16 child[2];
+};
+
+typedef enum {
+	NGNFS_RBT_LEFT = 0,
+	NGNFS_RBT_RIGHT = 1,
+} ngnfs_rbt_dir_t;
+
 struct ngnfs_btree_ref {
 	__le64 bnr;
 	/* XXX block alloc counter, too?  hmm. */
