@@ -1,637 +1,1250 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+#include "shared/lk/align.h"
 #include "shared/lk/bitops.h"
+#include "shared/lk/build_bug.h"
 #include "shared/lk/bug.h"
 #include "shared/lk/byteorder.h"
 #include "shared/lk/container_of.h"
 #include "shared/lk/errno.h"
-#include "shared/lk/math.h"
+#include "shared/lk/kernel.h"
+#include "shared/lk/limits.h"
 #include "shared/lk/minmax.h"
 #include "shared/lk/types.h"
-#include "shared/lk/sort.h"
 #include "shared/lk/stddef.h"
 #include "shared/lk/string.h"
-#include "shared/lk/unaligned.h"
 
+#include "shared/block.h"
 #include "shared/btree.h"
+#include "shared/compare.h"
 #include "shared/format-block.h"
+#include "shared/rbt.h"
+#include "shared/txn.h"
 
 /*
- * The internal block format which stores items is balancing operational
- * cost with structural complexity.  We have users which want different
- * key sizes and either no values or values that could use the entire
- * block if we let them (large xattr values).
+ * These block btrees are used to sort items with variable size value
+ * payloads and unpredictable key distribution.  In the file system,
+ * that means dirents, xattrs, and global indices.
  *
- * Inode index keys are a few u64s so aligning keys with any additional
- * metadata adds significant overhead, decreasing the fanout and
- * increasing tree height.  We pack everything at byte offsets and take
- * the hit of performing unaligned access.
+ * We use persistent in-block rbtrees to sort the items by their keys.
+ * Critical users, particularly the global index, can have blocks with
+ * random key distribution and insertion patterns and no value payload
+ * at all.  With that, and the undo buffers, we want to minimize stores
+ * as much as possible during insertion.  Their logarithmic scaling of
+ * operation cost with block size (by way of item count) sets us up well
+ * for supporting large block sizes.
  *
- * We verify blocks as we read so we want as few degrees of freedom as
- * possible that would have to be checked.
+ * We don't track free internal space in the blocks.  An allocation
+ * offset advances towards the tail as we allocate.  We can compact
+ * items in a block to free internal space before splitting a block to
+ * satisfy insertion.
+ */
+
+/*
+ * If a block's total_free reaches this value then we try to move items
+ * from a neighbor to fill it above the threshold.  If the neighbor is
+ * also at the threshold then the two blocks are merged.
  *
- * These low level btree core functions are concerned with modifying the
- * structures in blocks.  Callers manage block serialization, reading,
- * writing, allocation, and freeing.
- *
- * Item's keys and values are copied to and from buffers in the callers,
- * avoiding having to worry about referencing block contents after we
- * return.
- *
- * XXX:
- *  - zero freed space as we move/compact/delete items
- *  - per-cpu item sorting offset array to avoid double sort
+ * We want to leave some slack between the max size of a merged block
+ * (80% full) and a full block so that the repeated insertion and
+ * deletion of a few items doesn't bounce a pair of blocks between
+ * splitting and merging.
  */
+#define NGNFS_BTREE_MERGE_FREE_THRESH	(NGNFS_BTREE_MAX_FREE * 40 / 100)
 
 /*
- * Item space utilization includes its entry in the item_off array.
+ * If an insertion could be performed after compacting free space, but
+ * total free space is less than this threshold, then we'll split the
+ * block instead.  This avoids excessive compaction if insert/delete
+ * cycles constantly delete to create fragmented space and then try to
+ * insert into it.  The higher we set this value the more items need to
+ * be involved in the cycle before each compaction, so the lower its
+ * amortized cost.
  */
-#define ITEM_OFF_SIZE	sizeof_field(struct ngnfs_btree_block, item_off[0])
+#define NGNFS_BTREE_SPLIT_FREE_THRESH	(NGNFS_BTREE_MAX_FREE * 10 / 100)
+
+/* 0, ~0 don't need endian swapping */
+static struct ngnfs_btree_key min_key = { { 0, 0, 0} };
+static struct ngnfs_btree_key max_key = { { (__le64 __force)U64_MAX,
+					    (__le64 __force)U64_MAX,
+					    (__le64 __force)U64_MAX} };
 
 /*
- * The key follows the small size header in each item.
+ * This is here for now because we're storing the block number in the
+ * btree block header.  This will change as the network block protocol
+ * provides metadata for all blocks.
  */
-static void *key_ptr(struct ngnfs_btree_item *item)
+static void init_ref(struct ngnfs_block_ref *ref, struct ngnfs_btree_block *bt)
 {
-	return (void *)(item + 1);
+	ref->bnr = bt->bnr;
+}
+
+static void init_block(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *bt,
+		       u64 bnr, u8 level, struct ngnfs_btree_key *first,
+		       struct ngnfs_btree_key *last)
+{
+	ngnfs_rbt_init_root(tblk, &bt->item_root);
+	ngnfs_tblk_assign(tblk, bt->first, *first);
+	ngnfs_tblk_assign(tblk, bt->last, *last);
+	ngnfs_tblk_assign(tblk, bt->bnr, cpu_to_le64(bnr));
+	ngnfs_tblk_assign(tblk, bt->nr_items, 0);
+	ngnfs_tblk_assign(tblk, bt->tail_free, cpu_to_le16(NGNFS_BTREE_MAX_FREE));
+	ngnfs_tblk_assign(tblk, bt->total_free, bt->tail_free);
+	ngnfs_tblk_memset(tblk, &bt->__pad[0], 0, sizeof(bt->__pad));
+	ngnfs_tblk_assign(tblk, bt->level, level);
+	ngnfs_tblk_zero_tail(tblk, bt, sizeof(struct ngnfs_btree_block), NGNFS_BLOCK_SIZE);
+}
+
+static void bug_on_bad_item_off(size_t off)
+{
+	BUG_ON(off < sizeof(struct ngnfs_btree_block));
+	BUG_ON(off > (NGNFS_BLOCK_SIZE - sizeof(struct ngnfs_btree_item)));
+	BUG_ON(!IS_ALIGNED(off, NGNFS_BTREE_ITEM_ALIGN));
+}
+
+static struct ngnfs_btree_item *item_from_off(struct ngnfs_btree_block *bt, u16 off)
+{
+	if (off == 0)
+		return NULL;
+
+	bug_on_bad_item_off(off);
+
+	return (void *)bt + off;
+}
+
+static struct ngnfs_btree_item *item_from_node_off(struct ngnfs_btree_block *bt, __le16 node_off)
+{
+	if (node_off == 0)
+		return NULL;
+
+	return item_from_off(bt, le16_to_cpu(node_off) - offsetof(struct ngnfs_btree_item, node));
+}
+
+static u16 off_from_item(struct ngnfs_btree_block *bt, struct ngnfs_btree_item *item)
+{
+	size_t off = (void *)item - (void *)bt;
+
+	bug_on_bad_item_off(off);
+
+	return off;
+}
+
+static u16 aligned_item_size(u16 val_size)
+{
+	return ALIGN(sizeof(struct ngnfs_btree_item) + val_size, NGNFS_BTREE_ITEM_ALIGN);
+}
+
+static struct ngnfs_btree_item *item_from_node(struct ngnfs_rbt_node *node)
+{
+	return node ? container_of(node, struct ngnfs_btree_item, node) : NULL;
+}
+
+static struct ngnfs_btree_item *first_item(struct ngnfs_btree_block *bt)
+{
+	return item_from_node(ngnfs_rbt_first(&bt->item_root));
+}
+
+static struct ngnfs_btree_item *last_item(struct ngnfs_btree_block *bt)
+{
+	return item_from_node(ngnfs_rbt_last(&bt->item_root));
+}
+
+static struct ngnfs_btree_item *next_item(struct ngnfs_btree_block *bt,
+					  struct ngnfs_btree_item *item)
+{
+	return item_from_node(ngnfs_rbt_next(&bt->item_root, &item->node));
+}
+
+static struct ngnfs_btree_item *prev_item(struct ngnfs_btree_block *bt,
+					  struct ngnfs_btree_item *item)
+{
+	return item_from_node(ngnfs_rbt_prev(&bt->item_root, &item->node));
+}
+
+static struct ngnfs_btree_item *first_postorder_item(struct ngnfs_btree_block *bt)
+{
+	return item_from_node(ngnfs_rbt_first_postorder(&bt->item_root));
+}
+
+static struct ngnfs_btree_item *next_postorder_item(struct ngnfs_btree_block *bt,
+						    struct ngnfs_btree_item *item)
+{
+	return item_from_node(ngnfs_rbt_next_postorder(&bt->item_root, &item->node));
+}
+
+static struct ngnfs_btree_key *last_key(struct ngnfs_btree_block *bt)
+{
+	struct ngnfs_btree_item *item = last_item(bt);
+
+	return item ? &item->key : NULL;
+}
+
+static int compare_keys(struct ngnfs_btree_key *a, struct ngnfs_btree_key *b)
+{
+	return ngnfs_compare(le64_to_cpu(a->k[0]), le64_to_cpu(b->k[0])) ?:
+	       ngnfs_compare(le64_to_cpu(a->k[1]), le64_to_cpu(b->k[1])) ?:
+	       ngnfs_compare(le64_to_cpu(a->k[2]), le64_to_cpu(b->k[2]));
 }
 
 /*
- * The item's val is stored after the key.
+ * Return for the next item in the tree >= the search key.  This stops
+ * searching if it finds an item matching the key.
  */
-static void *val_ptr(struct ngnfs_btree_item *item)
+static struct ngnfs_btree_item *search_next_item(struct ngnfs_btree_block *bt,
+						 struct ngnfs_btree_key *key)
 {
-	return key_ptr(item) + item->key_size;
-}
-
-/*
- * [gs]etters let us assert on oob accesses.
- */
-static inline u16 get_item_off(struct ngnfs_btree_block *bt, u16 pos)
-{
-	BUG_ON(pos > le16_to_cpu(bt->nr_items));
-
-	return le16_to_cpu(bt->item_off[pos]);
-}
-
-static inline void set_item_off(struct ngnfs_btree_block *bt, u16 pos, u16 off)
-{
-	BUG_ON(pos > le16_to_cpu(bt->nr_items));
-
-	bt->item_off[pos] = cpu_to_le16(off);
-}
-
-static inline struct ngnfs_btree_item *item_ptr(struct ngnfs_btree_block *bt, const u16 pos)
-{
-	return (void *)bt + get_item_off(bt, pos);
-}
-
-static inline struct ngnfs_btree_item *last_item_ptr(struct ngnfs_btree_block *bt)
-{
-	return item_ptr(bt, le16_to_cpu(bt->nr_items) - 1);
-}
-
-/*
- * The size taken up by the item struct payload stored at the offset,
- * does not include the item_off array element.
- */
-static inline u16 key_val_size(u16 key_size, u16 val_size)
-{
-	return sizeof(struct ngnfs_btree_item) + key_size + val_size;
-}
-static inline u16 item_size(struct ngnfs_btree_item *item)
-{
-	return key_val_size(item->key_size, le16_to_cpu(item->val_size));
-}
-
-/*
- * The total bytes consumed by an item, includes the item_off element
- * and the struct payload.
- */
-static inline u16 total_item_size(struct ngnfs_btree_item *item)
-{
-	return ITEM_OFF_SIZE + item_size(item);
-}
-
-/*
- * Return the byte offset after the avail_free region.  An item's size is often then subtracted
- * from this to find its allocated offset.
- */
-static inline u16 avail_free_end(struct ngnfs_btree_block *bt)
-{
-	return offsetof(struct ngnfs_btree_block, item_off[le16_to_cpu(bt->nr_items)]) +
-	       le16_to_cpu(bt->avail_free);
-}
-
-static inline void set_avail_free_end(struct ngnfs_btree_block *bt, u16 off)
-{
-	bt->avail_free = cpu_to_le16(off - offsetof(struct ngnfs_btree_block,
-						    item_off[le16_to_cpu(bt->nr_items)]));
-}
-
-/*
- * The number of bytes used by items, this is 0 in a new block.
- */
-static inline u16 used_size(struct ngnfs_btree_block *bt)
-{
-	return NGNFS_BLOCK_SIZE - (sizeof(struct ngnfs_btree_block) + le16_to_cpu(bt->total_free));
-}
-
-static inline u16 used_pct(struct ngnfs_btree_block *bt)
-{
-	return (u32)used_size(bt) * 100 / NGNFS_BTREE_MAX_FREE;
-}
-
-/*
- * Move item offset array elements starting with the given position to
- * the end of the array by the relative distance number of elements.
- * The will modify nr_items after the move.
- */
-static inline void memmove_tail_offs(struct ngnfs_btree_block *bt, u16 pos, s16 distance)
-{
-	s16 nr = le16_to_cpu(bt->nr_items) - pos;
-
-	if (nr > 0 && distance != 0)
-		memmove(&bt->item_off[pos + distance], &bt->item_off[pos],
-			nr * sizeof(bt->item_off[0]));
-}
-
-/*
- * Compare two variable length keys with big-endian key material.
- * Larger keys compare larger than smaller keys that are a prefix of the
- * larger.
- */
-static inline int cmp_keys(const void *key_a, const u16 size_a,
-			   const void *key_b, const u16 size_b)
-{
-	return memcmp(key_a, key_b, min(size_a, size_b)) ?: ((int)size_b - (int)size_a);
-}
-
-/*
- * Find the position in the item offset array that an item with the
- * given key would occupy.  This can return the next position after the
- * current array if the item would be inserted after all the existing
- * items.
- */
-struct btree_search_result {
-	u16 pos;
-	s16 cmp;
-};
-static struct btree_search_result btree_search(struct ngnfs_btree_block *bt, void *key,
-					       u16 key_size)
-{
-	struct btree_search_result res = { .pos = 0, .cmp = 1 };
 	struct ngnfs_btree_item *item;
-	s16 first = 0;
-	s16 last = le16_to_cpu(bt->nr_items) - 1;
+	ngnfs_rbt_dir_t dir;
+	int cmp;
 
-	while (first <= last) {
-		res.pos = (first + last) >> 1;
-		item = item_ptr(bt, res.pos);
-		res.cmp = cmp_keys(key, key_size, key_ptr(item), item->key_size);
+	item = item_from_node_off(bt, bt->item_root.node);
+	while (item) {
+		cmp = compare_keys(key, &item->key);
+		if (cmp == 0)
+			return item;
 
-		if (res.cmp == 0)
-			break;
-		else if (res.cmp < 0)
-			last = res.pos - 1;
+		if (cmp < 0)
+			dir = NGNFS_RBT_LEFT;
 		else
-			first = ++res.pos;
+			dir = NGNFS_RBT_RIGHT;
+
+		item = item_from_node_off(bt, item->node.child[dir]);
 	}
 
-	return res;
-}
-
-static void insert_item(struct ngnfs_btree_block *bt, u16 pos, void *key, size_t key_size,
-			void *val, size_t val_size)
-{
-	struct ngnfs_btree_item *item;
-	u16 size;
-	u16 off;
-
-	BUG_ON(pos > le16_to_cpu(bt->nr_items));
-
-	size = key_val_size(key_size, val_size);
-
-	/* XXX callers are checking that there's room?  how about compaction? */
-	BUG_ON(le16_to_cpu(bt->avail_free) < (ITEM_OFF_SIZE + size));
-
-	off = avail_free_end(bt) - size;
-	memmove_tail_offs(bt, pos, 1);
-	set_item_off(bt, pos, off);
-
-	le16_add_cpu(&bt->nr_items, 1);
-	le16_add_cpu(&bt->total_free, -(ITEM_OFF_SIZE + size));
-	le16_add_cpu(&bt->avail_free, -(ITEM_OFF_SIZE + size));
-
-	item = item_ptr(bt, pos);
-	item->key_size = key_size;
-	put_unaligned_le16(val_size, &item->val_size);
-	memcpy(key_ptr(item), key, key_size);
-	memcpy(val_ptr(item), val, val_size);
-}
-
-static void remove_item(struct ngnfs_btree_block *bt, u16 pos)
-{
-	struct ngnfs_btree_item *item;
-	u16 tot;
-
-	BUG_ON(pos > le16_to_cpu(bt->nr_items));
-
-	item = item_ptr(bt, pos);
-	tot = total_item_size(item);
-
-	le16_add_cpu(&bt->total_free, tot);
-
-	if (get_item_off(bt, pos) == avail_free_end(bt))
-		le16_add_cpu(&bt->avail_free, tot);
-	else
-		le16_add_cpu(&bt->avail_free, ITEM_OFF_SIZE);
-
-	memmove_tail_offs(bt, pos + 1, -1);
-	set_item_off(bt, le16_to_cpu(bt->nr_items) - 1, 0);
-	le16_add_cpu(&bt->nr_items, -1);
+	return NULL;
 }
 
 /*
- * Move items from the end of one btree block to the opposite end of
- * another.
- *
- * @src_first tells us if we're moving from the first item in the src to
- * the last item in the dst, or vice versa.
- *
- * @drain_src tells us if we're moving all the items from the src into
- * the dst or if we're trying to balance the space consumed by the items
- * in the blocks.  We always move at least one item, even if we weren't
- * draining and the item utilization of the blocks is equal as we're
- * called.
+ * Return for the next item in the tree >= the search key.  This always
+ * provides the item before the item that's returned, particularly when
+ * null is returned.
  */
-static void move_items(struct ngnfs_btree_block *dst, struct ngnfs_btree_block *src,
-		       bool src_first, bool drain_src)
+static struct ngnfs_btree_item *search_next_prev_item(struct ngnfs_btree_block *bt,
+						      struct ngnfs_btree_key *key,
+						      struct ngnfs_btree_item **prev)
 {
-	struct ngnfs_btree_item *src_item;
-	struct ngnfs_btree_item *dst_item;
-	s16 target;
-	s16 moving;
-	u16 size;
-	u16 off;
-	u16 nr;
-	u16 s;
-	u16 d;
-	s16 i;
+	struct ngnfs_btree_item *item;
+	ngnfs_rbt_dir_t dir;
+	int cmp;
 
-	BUG_ON(le16_to_cpu(src->nr_items) == 0);
+	*prev = NULL;
 
-	/* find the number of items to move */
-	if (drain_src) {
-		nr = le16_to_cpu(src->nr_items);
-		moving = used_size(src);
-	} else {
-		target = (used_size(src) - used_size(dst)) >> 1;
-		nr = 0;
-		moving = 0;
-		if (src_first) {
-			for (i = 0; moving <= target && i < le16_to_cpu(src->nr_items); i++, nr++)
-				moving += total_item_size(item_ptr(src, i));
-		} else {
-			for (i = le16_to_cpu(src->nr_items) - 1; i >= 0; i--, nr++)
-				moving += total_item_size(item_ptr(src, i));
+	item = item_from_node_off(bt, bt->item_root.node);
+	while (item) {
+		cmp = compare_keys(key, &item->key);
+		if (cmp == 0) {
+			*prev = prev_item(bt, item);
+			return item;
 		}
-	}
 
-	/* setup item regions for iterative walk of both regions */
-	if (src_first) {
-		s = 0;
-		d = le16_to_cpu(dst->nr_items) - nr;
-	} else {
-		s = le16_to_cpu(src->nr_items) - nr;
-		d = 0;
-	}
-
-	/* compact dst for item alloc, and make room in item off array for incoming items */
-	ngnfs_btree_compact(dst);
-	if (!src_first)
-		memmove_tail_offs(dst, 0, nr);
-
-	off = avail_free_end(dst);
-	for (i = 0; i < nr; i++) {
-		src_item = item_ptr(src, s + i);
-		size = item_size(src_item);
-
-		off -= size;
-		set_item_off(dst, d + i, off);
-		dst_item = item_ptr(dst, d + i);
-
-		memcpy(dst_item, src_item, size);
-	}
-
-	/* collapse the front of the src item offs array after items left */
-	if (src_first)
-		memmove_tail_offs(src, nr, -nr);
-
-	le16_add_cpu(&src->nr_items, -nr);
-	le16_add_cpu(&src->total_free, moving);
-
-	le16_add_cpu(&dst->nr_items, nr);
-	le16_add_cpu(&dst->total_free, -moving);
-	dst->avail_free = dst->total_free; /* dst was compacted, total == avail */
-}
-
-static void init_btree_ref(struct ngnfs_btree_ref *ref, struct ngnfs_btree_block *child)
-{
-	ref->bnr = child->bnr;
-}
-
-/*
- * These updates of the parent items rely on incoming block validation
- * having verified that the items in the parent blocks were of the
- * correct length.
- */
-static void insert_parent_item(struct ngnfs_btree_block *bt, u16 pos,
-			       struct ngnfs_btree_block *child)
-{
-	struct ngnfs_btree_item *last = last_item_ptr(child);
-	struct ngnfs_btree_ref ref;
-
-	init_btree_ref(&ref, child);
-
-	insert_item(bt, pos, key_ptr(last), last->key_size, &ref, sizeof(ref));
-}
-
-static void update_parent_key(struct ngnfs_btree_block *bt, u16 pos,
-			      struct ngnfs_btree_block *child)
-{
-	struct ngnfs_btree_item *item = item_ptr(bt, pos);
-	struct ngnfs_btree_item *last = last_item_ptr(child);
-
-	/* should be verified on read */
-	BUG_ON(item->key_size != last->key_size);
-
-	memcpy(key_ptr(item), key_ptr(last), last->key_size);
-}
-
-static void update_parent_ref(struct ngnfs_btree_block *bt, u16 pos,
-			      struct ngnfs_btree_block *child)
-{
-	struct ngnfs_btree_item *item = item_ptr(bt, pos);
-	struct ngnfs_btree_item *last = last_item_ptr(child);
-	struct ngnfs_btree_ref ref;
-
-	init_btree_ref(&ref, child);
-
-	/* should be verified on read */
-	BUG_ON(get_unaligned_le16(&item->val_size) != get_unaligned_le16(&last->val_size));
-
-	memcpy(val_ptr(item), val_ptr(last), get_unaligned_le16(&last->val_size));
-}
-
-void ngnfs_btree_init_block(struct ngnfs_btree_block *bt, u8 level)
-{
-	/* XXX do we want to zero the block here?  callers' responsibility? */
-	bt->bnr = 0; /* XXX */
-	bt->nr_items = 0;
-	bt->total_free = cpu_to_le16(NGNFS_BTREE_MAX_FREE);
-	bt->avail_free = bt->total_free;
-	bt->level = level;
-}
-
-int ngnfs_btree_lookup(struct ngnfs_btree_block *bt, void *key, size_t key_size,
-		       void *val, size_t val_size)
-{
-	struct btree_search_result res;
-	struct ngnfs_btree_item *item;
-	int ret;
-
-	res = btree_search(bt, key, key_size);
-
-	if (res.cmp == 0) {
-		item = item_ptr(bt, res.pos);
-		ret = min(val_size, get_unaligned_le16(&item->val_size));
-		if (ret > 0)
-			memcpy(val, val_ptr(item), ret);
-	} else {
-		ret = -ENOENT;
-	}
-
-	return ret;
-}
-
-int ngnfs_btree_insert(struct ngnfs_btree_block *bt, void *key, size_t key_size,
-		       void *val, size_t val_size)
-{
-	struct btree_search_result res;
-	int ret;
-
-	if (WARN_ON_ONCE(key_size == 0 || key_size > NGNFS_BTREE_KEY_SIZE_MAX ||
-			 val_size > NGNFS_BTREE_VAL_SIZE_MAX))
-		return -EINVAL;
-
-	res = btree_search(bt, key, key_size);
-
-	if (res.cmp == 0) {
-		ret = -EEXIST;
-	} else {
-		insert_item(bt, res.pos, key, key_size, val, val_size);
-		ret = 0;
-	}
-
-	return ret;
-}
-
-int ngnfs_btree_delete(struct ngnfs_btree_block *bt, void *key, size_t key_size)
-{
-	struct btree_search_result res;
-	int ret;
-
-	res = btree_search(bt, key, key_size);
-
-	if (res.cmp == 0) {
-		remove_item(bt, res.pos);
-		ret = 0;
-	} else {
-		ret = -ENOENT;
-	}
-
-	return ret;
-}
-
-/*
- * Split the items from a full block into its empty lesser sibling.
- * Moving items to the left maintains the separator key in the existing
- * block ref and we only have to add the new sibling parent item with
- * its new separator key.
- */
-void ngnfs_btree_split(struct ngnfs_btree_block *parent, u16 bt_pos,
-		       struct ngnfs_btree_block *bt, struct ngnfs_btree_block *sib)
-{
-	move_items(sib, bt, true, false);
-	insert_parent_item(parent, bt_pos, sib);
-}
-
-/*
- * The destination btree block has fallen under the minimum number of
- * items.  Refill it from a neighbouring sibling, either balancing the
- * two or merging all of the sibling items into the block.
- *
- * If we emptied the sibling we remove the parent item referencing it.
- * If the sibling was greater (to the right) it's parent key can be a
- * separator between further blocks or the maximal key on the right
- * spline of the tree.  That can be different than the last key in the
- * block.  So if we remove a greater sibling we maintain its separator
- * key by having it reference the remaining block and remove the block's
- * parent item.
- *
- * The caller examines the sib block when it returns to find that it's
- * been emptied so it can free its bnr and drop it from the cache.
- */
-void ngnfs_btree_refill(struct ngnfs_btree_block *parent, u16 bt_pos, u16 sib_pos,
-			struct ngnfs_btree_block *bt, struct ngnfs_btree_block *sib)
-{
-	bool src_first = sib_pos > bt_pos;
-	bool drain_src = used_pct(bt) + used_pct(sib) <= NGNFS_BTREE_MIN_USED_PCT * 2;
-
-	move_items(bt, sib, src_first, drain_src);
-
-	if (sib->nr_items != 0) {
-		/* update the left parent's separator key between the two blocks */
-		if (bt_pos < sib_pos)
-			update_parent_key(parent, bt_pos, bt);
-		else
-			update_parent_key(parent, sib_pos, sib);
-	} else {
-		/* remove empty sib parent item, being careful to maintain greater separator */
-		if (bt_pos < sib_pos) {
-			update_parent_ref(parent, sib_pos, bt);
-			remove_item(parent, bt_pos);
+		if (cmp < 0) {
+			dir = NGNFS_RBT_LEFT;
 		} else {
-			remove_item(parent, sib_pos);
+			*prev = item;
+			dir = NGNFS_RBT_RIGHT;
 		}
+
+		item = item_from_node_off(bt, item->node.child[dir]);
 	}
-}
 
-static int cmp_item_off(const void *a, const void *b, const void *priv)
-{
-	const __le16 *off_a = a;
-	const __le16 *off_b = b;
-
-	return (int)le16_to_cpu(*off_b) - (int)le16_to_cpu(*off_a);
-}
-
-static int cmp_item_key(const void *a, const void *b, const void *priv)
-{
-	const __le16 *off_a = a;
-	const __le16 *off_b = b;
-	const struct ngnfs_btree_block *bt = priv;
-	struct ngnfs_btree_item *item_a = (void *)bt + le16_to_cpu(*off_a);
-	struct ngnfs_btree_item *item_b = (void *)bt + le16_to_cpu(*off_b);
-
-	return cmp_keys(key_ptr(item_a), item_a->key_size,
-			key_ptr(item_b), item_b->key_size);
-}
-
-/* kernel's lib/sort.c doesn't have a _16 variant */
-static void swap_words_16(void *a, void *b, int n, const void *priv)
-{
-        do {
-                u16 t = *(u16 *)(a + (n -= 4));
-                *(u16 *)(a + n) = *(u16 *)(b + n);
-                *(u16 *)(b + n) = t;
-        } while (n);
+	return NULL;
 }
 
 /*
- * Move all the items to the end of the block so that all the free space
- * is gathered for allocation between the item offsets and the first
- * item.
+ * True if there's room in the block for an insertion, just not
+ * contiguously available at the tail of the block.  The caller is using
+ * this after having checked if they should split so we don't have to
+ * check if the block is too full to justify compacting.
  */
-void ngnfs_btree_compact(struct ngnfs_btree_block *bt)
+static bool should_compact(struct ngnfs_btree_block *bt, u16 val_size)
+{
+	u16 size = aligned_item_size(val_size);
+
+	return (size > le16_to_cpu(bt->tail_free)) && (size <= le16_to_cpu(bt->total_free));
+}
+
+/*
+ * True if the caller should split the block before trying to insert an
+ * item with the given val size.
+ *
+ * We split if the item doesn't fit in free space at all.
+ *
+ * But we'll also split if the item doesn't fit in tail free space and
+ * would fit in fragmented free space, but free space is so low that
+ * we're likely to split anyway soon after compaction.
+ */
+static bool should_split(struct ngnfs_btree_block *bt, u16 val_size)
+{
+	u16 size = aligned_item_size(val_size);
+	u16 total_free = le16_to_cpu(bt->total_free);
+
+	return (size > total_free) ||
+	       (size > le16_to_cpu(bt->tail_free) && total_free < NGNFS_BTREE_SPLIT_FREE_THRESH);
+}
+
+/*
+ * True if the caller should merge after removing an item with the given
+ * value size.  The free space gets large enough that the item
+ * population must be small enough and we want to pull items from
+ * neighboring blocks to restore balance.
+ */
+static bool should_merge(struct ngnfs_btree_block *bt, u16 val_size)
+{
+	return le16_to_cpu(bt->total_free) + aligned_item_size(val_size) >=
+		NGNFS_BTREE_MERGE_FREE_THRESH;
+}
+
+/*
+ * Consume free space at the end of the block to create a new item,
+ * initialize it with the caller's arguments, and link it into the tree
+ * at the parent's link.
+ *
+ * Because this references an existing item we will not compact items
+ * here.  The caller must have ensured that there was sufficient free
+ * space for the item.
+ */
+static struct ngnfs_btree_item *insert_item(struct ngnfs_txn_block *tblk,
+					    struct ngnfs_btree_block *bt,
+					    struct ngnfs_btree_key *key, void *val, u16 val_size,
+					    struct ngnfs_rbt_node *parent, ngnfs_rbt_dir_t dir)
+{
+	u16 bytes = aligned_item_size(val_size);
+	struct ngnfs_btree_item *item;
+
+	BUG_ON(compare_keys(key, &bt->first) < 0);
+	BUG_ON(compare_keys(key, &bt->last) > 0);
+	BUG_ON(bytes <= le16_to_cpu(bt->tail_free));
+
+	item = item_from_off(bt, NGNFS_BLOCK_SIZE - le16_to_cpu(bt->tail_free));
+	ngnfs_tblk_le16_add_cpu(tblk, &bt->tail_free, -bytes);
+	ngnfs_tblk_le16_add_cpu(tblk, &bt->total_free, -bytes);
+	ngnfs_tblk_le16_add_cpu(tblk, &bt->nr_items, 1);
+
+	ngnfs_tblk_assign(tblk, item->key, *key);
+	ngnfs_tblk_assign(tblk, item->val_size, cpu_to_le16(val_size));
+	if (val_size) {
+		ngnfs_tblk_memcpy(tblk, &item->val[0], val, val_size);
+		ngnfs_tblk_zero_tail(tblk, &item->val[0], val_size,
+				     ALIGN(val_size, NGNFS_BTREE_ITEM_ALIGN));
+	}
+
+	ngnfs_rbt_insert(tblk, &bt->item_root, parent, dir, &item->node);
+
+	return item;
+}
+
+/*
+ * Given two adjacent nodes in the tree, we can always find the parent
+ * node to insert an item between them.
+ */
+static struct ngnfs_btree_item *insert_item_between(struct ngnfs_txn_block *tblk,
+						    struct ngnfs_btree_block *bt,
+						    struct ngnfs_btree_key *key,
+						    void *val, u16 val_size,
+						    struct ngnfs_btree_item *prev,
+						    struct ngnfs_btree_item *next)
+{
+	struct ngnfs_rbt_node *parent;
+	ngnfs_rbt_dir_t dir;
+
+	BUG_ON(prev && next_item(bt, prev) != next);
+	BUG_ON(next && prev_item(bt, next) != prev);
+	BUG_ON(prev && compare_keys(key, &prev->key) <= 0);
+	BUG_ON(next && compare_keys(key, &next->key) >= 0);
+
+	if (!prev && !next) {
+		parent = NULL;
+		dir = NGNFS_RBT_RIGHT;
+	} else if (prev && !prev->node.child[NGNFS_RBT_RIGHT]) {
+		parent = &prev->node;
+		dir = NGNFS_RBT_RIGHT;
+	} else {
+		parent = &next->node;
+		dir = NGNFS_RBT_LEFT;
+	}
+
+	return insert_item(tblk, bt, key, val, val_size, parent, dir);
+}
+
+/*
+ * Delete an item by removing it from the rbt and zeroing its bytes.
+ * This almost certainly leaves behind fragmented free space in the
+ * block that will later be reclaimed by compaction.
+ */
+static void delete_item(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *bt,
+			struct ngnfs_btree_item *item)
+{
+	u16 bytes = aligned_item_size(le16_to_cpu(item->val_size));
+	u16 off = off_from_item(bt, item);
+
+	if (off == NGNFS_BLOCK_SIZE - le16_to_cpu(bt->tail_free) - bytes)
+		ngnfs_tblk_le16_add_cpu(tblk, &bt->tail_free, bytes);
+	ngnfs_tblk_le16_add_cpu(tblk, &bt->total_free, bytes);
+	ngnfs_tblk_le16_add_cpu(tblk, &bt->nr_items, -1);
+
+	ngnfs_rbt_delete(tblk, &bt->item_root, &item->node);
+	ngnfs_tblk_memset(tblk, item, 0, bytes);
+}
+
+static int compact_cmp_by(struct ngnfs_btree_block *by_off,
+			  struct ngnfs_btree_item *a, struct ngnfs_btree_item *b)
+{
+	return by_off ? ngnfs_compare(off_from_item(by_off, a), off_from_item(by_off, b)) :
+			compare_keys(&a->key, &b->key);
+}
+
+static void compact_insert_by(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *bt,
+			      struct ngnfs_btree_item *item, bool by_key)
+{
+	struct ngnfs_btree_block *by_off = by_key ? NULL : bt;
+	struct ngnfs_btree_item *parent;
+	ngnfs_rbt_dir_t dir;
+	int cmp;
+
+	/* insert at leaf */
+	parent = item_from_node_off(bt, bt->item_root.node);
+	dir = NGNFS_RBT_RIGHT;
+	while (parent) {
+		cmp = compact_cmp_by(by_off, item, parent);
+		dir = cmp < 0 ? NGNFS_RBT_LEFT : NGNFS_RBT_RIGHT;
+		parent = item_from_node_off(bt, parent->node.child[dir]);
+	}
+
+	ngnfs_rbt_insert(tblk, &bt->item_root, parent ? &parent->node : NULL, dir, &item->node);
+}
+
+static void compact_sort_by(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *bt, bool by_key)
 {
 	struct ngnfs_btree_item *item;
-	u16 size;
-	u16 off;
-	u16 nr;
-	u16 i;
 
-	if (bt->avail_free == bt->total_free)
+	item = first_postorder_item(bt);
+	ngnfs_rbt_init_root(tblk, &bt->item_root);
+	for (; item; item = next_postorder_item(bt, item))
+		compact_insert_by(tblk, bt, item, by_key);
+}
+
+/*
+ * Defragment internal free space by moving all the items towards the
+ * front of the block, gathering all free space to the end.  Items can
+ * be of any sizes so we sort the item rbt by offset, iterate and move
+ * in offset order, then sort by key.
+ *
+ * Doing it this way is expensive at run time but avoids the code and
+ * structural complexity of tracking internal free space or also
+ * indexing by offset.  We'll see if we can keep compaction frequency
+ * low enough to justify the tradeoff.
+ */
+static void compact_items(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *bt)
+{
+	struct ngnfs_btree_item *item;
+	struct ngnfs_btree_item *old;
+	u16 bytes;
+	u16 off;
+
+	if (bt->nr_items == 0 || bt->tail_free == bt->total_free)
 		return;
 
-	nr = le16_to_cpu(bt->nr_items);
-	sort_r(&bt->item_off[0], nr, sizeof(bt->item_off[0]), cmp_item_off, swap_words_16, bt);
+	compact_sort_by(tblk, bt, false);
 
-	off = NGNFS_BLOCK_SIZE;
-	for (i = nr - 1; i >= 0; i--) {
-		item = item_ptr(bt, i);
-		size = item_size(item);
-		off -= size;
-		if (get_item_off(bt, i) != off) {
-			set_item_off(bt, i, off);
-			memmove(item_ptr(bt, i), item, size);
+	off = sizeof(struct ngnfs_btree_block);
+	for (item = first_item(bt); item; item = next_item(bt, item)) {
+		bytes = aligned_item_size(le16_to_cpu(item->val_size));
+		if (off_from_item(bt, item) != off) {
+			old = item;
+			item = item_from_off(bt, off);
+			ngnfs_tblk_memmove(tblk, item, old, bytes);
+			ngnfs_rbt_moved(tblk, &bt->item_root, &item->node, &old->node);
 		}
+		off += bytes;
 	}
 
-	bt->avail_free = bt->total_free;
+	compact_sort_by(tblk, bt, true);
 
-	sort_r(&bt->item_off[0], nr, sizeof(bt->item_off[0]), cmp_item_key, swap_words_16, bt);
+	/* zero newly free region before existing free tail free */
+	bytes = le16_to_cpu(bt->total_free) - le16_to_cpu(bt->tail_free);
+	ngnfs_tblk_memset(tblk, item_from_off(bt, off), 0, bytes);
+
+	ngnfs_tblk_assign(tblk, bt->tail_free, bt->total_free);
 }
 
-bool ngnfs_btree_verify(struct ngnfs_btree_block *bt)
+/*
+ * Move items from the source block to the destination block.  
+ *
+ * We need to compact the destination before we move so that there's
+ * room for the moving items.  This is used by splitting and merging
+ * which also has to ensure that both of its output blocks are
+ * sufficiently compacted to receive an insertion.  We simplify and
+ * always compact the source after moving items, as well.
+ *
+ * Since we're always moving to the end of the dst block we can always
+ * insert onto the last item moved in the dst block, at the link in the
+ * opposite direction of the move.
+ *
+ * @to_right moves items in descending order from the end of the src
+ * block to the front of the dst block.  When false it moves in the
+ * opposite direction: in ascending order from the start of the src
+ * block to the end of the dst block.
+ *
+ * @until_balanced always tries to move at least one item and stops when
+ * the dst block has at least as many bytes used by items as the src
+ * block.  Otherwise it tries to move all the items from the src block.
+ */
+static void move_items(struct ngnfs_txn_block *dst_tblk, struct ngnfs_btree_block *dst,
+		       struct ngnfs_txn_block *src_tblk, struct ngnfs_btree_block *src,
+		       bool to_right, bool until_balanced)
+{
+	struct ngnfs_rbt_node *parent;
+	struct ngnfs_btree_item *from;
+	struct ngnfs_btree_item *del;
+	struct ngnfs_btree_item *to;
+	ngnfs_rbt_dir_t dir;
+
+	BUG_ON(dst == src);
+
+	if (src->nr_items == 0)
+		return;
+
+	compact_items(dst_tblk, dst);
+
+	from = to_right ? last_item(src) : first_item(src);
+	to = to_right ? first_item(dst) : last_item(dst);
+	if (to) {
+		parent = &to->node;
+		dir = to_right ? NGNFS_RBT_LEFT : NGNFS_RBT_RIGHT;
+	} else {
+		parent = NULL;
+		dir = NGNFS_RBT_RIGHT;
+	}
+
+	while (from) {
+		to = insert_item(dst_tblk, dst, &from->key, from->val,
+				 le16_to_cpu(from->val_size), parent, dir);
+		parent = &to->node;
+
+		del = from;
+		from = to_right ? prev_item(src, from) : next_item(src, from);
+		delete_item(src_tblk, src, del);
+
+		if (until_balanced && le16_to_cpu(dst->total_free) <= le16_to_cpu(src->total_free))
+			break;
+	}
+
+	compact_items(src_tblk, src);
+}
+
+/*
+ * Copy the reference from the parent item's value.
+ */
+static void copy_ref(struct ngnfs_block_ref *ref, struct ngnfs_btree_item *item)
+{
+	/* XXX should have been caught by verification */
+	BUG_ON(le16_to_cpu(item->val_size) != sizeof(struct ngnfs_block_ref));
+
+	memcpy(ref, item->val, sizeof(struct ngnfs_block_ref));
+}
+/*
+ * The caller must have initialized the child's last key for the parent's ref item.
+ */
+static void insert_parent_ref(struct ngnfs_txn_block *tblk, struct ngnfs_btree_block *parent,
+			      struct ngnfs_btree_block *child)
 {
 	struct ngnfs_btree_item *item;
 	struct ngnfs_btree_item *prev;
-	unsigned long start;
-	unsigned long size;
-	unsigned long off;
-	u16 free;
-	u16 nr;
-	u16 i;
+	struct ngnfs_block_ref ref;
 
-	nr = le16_to_cpu(bt->nr_items);
-	if (nr > NGNFS_BTREE_MAX_ITEMS)
-		return false;
+	item = search_next_prev_item(parent, &child->last, &prev);
+	BUG_ON(item && compare_keys(&item->key, &child->last) == 0);
+	init_ref(&ref, child);
+	insert_item_between(tblk, parent, &child->last, &ref, sizeof(ref), prev, item);
+}
 
-	sort_r(&bt->item_off[0], nr, sizeof(bt->item_off[0]), cmp_item_off, swap_words_16, bt);
+/*
+ * Tracks block references as we traverse the btree.  Splitting and
+ * merging updates this to allocate or free parents or to redirect
+ * traversal into a newly allocated result of a split.
+ */
+struct traversal_blocks {
+	struct ngnfs_txn_block *parent_tblk;
+	struct ngnfs_btree_block *parent;
+	struct ngnfs_txn_block *tblk;
+	struct ngnfs_btree_block *bt;
+};
 
-	/* item payloads must be after the offset array and within the block, and not overlap */
-	off = offsetof(struct ngnfs_btree_block, item_off[nr]);
-	free = 0;
-	for (i = 0; i < nr; i++) {
-		start = get_item_off(bt, i);
-		if (start < off || (start + sizeof(struct ngnfs_btree_item)) > NGNFS_BLOCK_SIZE)
-			return false;
+static void init_traversal_blocks(struct traversal_blocks *trav)
+{
+	memset(trav, 0, sizeof(struct traversal_blocks));
+}
 
-		item = item_ptr(bt, i);
-		size = item_size(item);
-		if (size > NGNFS_BLOCK_SIZE || start + size > NGNFS_BLOCK_SIZE)
-			return false;
+/*
+ * The ordered blocks have had items moved between them.  Reset their
+ * inner last,first key range boundary to reflect the key of the last
+ * item in the left block.
+ */
+static void reset_key_range_boundary(struct ngnfs_txn_block *left_tblk,
+				     struct ngnfs_btree_block *left,
+				     struct ngnfs_txn_block *right_tblk,
+				     struct ngnfs_btree_block *right)
+{
+	struct ngnfs_btree_key key;
 
-		if (start > off)
-			free += start - off;
+	BUG_ON(compare_keys(&left->first, &right->last) >= 0);
 
-		off = start + size;
+	key = *last_key(left);
+	ngnfs_tblk_assign(left_tblk, left->last, key);
+	ngnfs_btree_key_inc(&key);
+	ngnfs_tblk_assign(right_tblk, right->first, key);
+}
+
+/*
+ * Allocate a new btree block and point the root block ref at it.  The
+ * caller will initialize it as a new leaf block or new parent block.
+ */
+static int alloc_root_block(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			    struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+			    struct ngnfs_txn_block **tblkp, struct ngnfs_btree_block **btp)
+{
+	struct ngnfs_block_ref ref;
+	u64 bnr;
+	int ret;
+
+	ret = ngnfs_txn_alloc_meta(txn, &bnr);
+	if (ret < 0)
+		goto out;
+
+	ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_WRITE | NBF_NEW, tblkp, (void **)btp);
+	if (ret < 0)
+		goto out;
+
+	init_block(*tblkp, *btp, bnr, root->height, &min_key, &max_key);
+
+	init_ref(&ref, *btp);
+	ngnfs_tblk_assign(root_tblk, root->ref, ref);
+	ngnfs_tblk_assign(root_tblk, root->height, root->height + 1);
+	ret = 0;
+out:
+	return ret;
+}
+
+/*
+ * See if we can free the root block.  We can either free a parent with
+ * a single ref item or a leaf with no items, never both.
+ */
+static int check_free_root_block(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+				 struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+				 struct traversal_blocks *trav)
+{
+	struct ngnfs_btree_block *bt = NULL;
+	struct ngnfs_block_ref ref;
+	u8 level;
+
+	if (trav->parent && root->ref.bnr == trav->parent->bnr) {
+		bt = trav->parent;
+		if (le16_to_cpu(bt->nr_items) == 1)
+			memcpy(&ref, last_item(bt)->val, sizeof(ref));
+		else
+			bt = NULL;
+
+	} else if (trav->bt && root->ref.bnr == trav->bt->bnr) {
+		bt = trav->bt;
+		if (bt->nr_items == 0)
+			memset(&ref, 0, sizeof(ref));
+		else
+			bt = NULL;
 	}
-	free += NGNFS_BLOCK_SIZE - off;
 
-	/* avail_free can't overlap with any existing items */
-	if (avail_free_end(bt) > get_item_off(bt, 0))
-		return false;
+	if (bt) {
+		level = bt->level;
+		/* ret = ngnfs_txn_free_meta(nfi, txn, tblk, le64_to_cpu(bt->bnr)) */
+		ngnfs_tblk_assign(root_tblk, root->ref, ref);
+		ngnfs_tblk_assign(root_tblk, root->height, level);
 
-	/* total free matches free space */
-	if (le16_to_cpu(bt->total_free) != free)
-		return false;
-
-	/* XXX this will clobber(/fix) bad key sorting, but we can at least test dupes */
-	sort_r(&bt->item_off[0], nr, sizeof(bt->item_off[0]), cmp_item_key, swap_words_16, bt);
-
-	prev = item_ptr(bt, 0);
-	for (i = 1; i < nr; i++) {
-		item = item_ptr(bt, i);
-
-		/* sorted keys must strictly increase */
-		if (cmp_keys(key_ptr(item), item->key_size,
-			     key_ptr(prev), prev->key_size) <= 0)
-			return false;
-
-		prev = item;
+		if (bt == trav->parent) {
+			trav->parent_tblk = NULL;
+			trav->parent = NULL;
+		} else {
+			trav->tblk = NULL;
+			trav->bt = NULL;
+		}
 	}
 
-	return true;
+	return 0;
+}
+
+/*
+ * Split a block, moving items to a newly allocated block.  We move
+ * items to balance the space they take up, not the number of items.
+ * The new block is always empty so we can always move items.  We move
+ * items to a new empty block to the left so that we only have to insert
+ * a new parent item and don't have to modify the existing parent item's
+ * key.
+ */
+static int split_block(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+		       struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+		       struct traversal_blocks *trav, struct ngnfs_btree_key *key)
+{
+	struct ngnfs_txn_block *nei_tblk;
+	struct ngnfs_btree_block *nei;
+	u64 bnr;
+	int ret;
+
+	/* allocate new parent if we don't have one */
+	if (!trav->parent) {
+		ret = alloc_root_block(nfi, txn, root_tblk, root,
+				       &trav->parent_tblk, &trav->parent);
+		if (ret < 0)
+			goto out;
+
+		init_block(trav->parent_tblk, trav->parent, bnr, trav->bt->level + 1,
+			   &min_key, &max_key);
+		insert_parent_ref(trav->parent_tblk, trav->parent, trav->bt);
+	}
+
+	/* allocate and initialize new nei */
+	ret = ngnfs_txn_alloc_meta(txn, &bnr);
+	if (ret < 0)
+		goto out;
+
+	ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_WRITE | NBF_NEW, &nei_tblk, (void **)&nei);
+	if (ret < 0)
+		goto out;
+
+	init_block(nei_tblk, nei, bnr, trav->bt->level, &trav->bt->first, &trav->bt->last);
+	move_items(nei_tblk, nei, trav->tblk, trav->bt, false, true);
+	reset_key_range_boundary(nei_tblk, nei, trav->tblk, trav->bt);
+	insert_parent_ref(trav->parent_tblk, trav->parent, nei);
+
+	/*
+	 * Continue the caller's traversal through the split nei if
+	 * we moved the key to the nei.
+	 */
+	if (compare_keys(key, &nei->last) <= 0) {
+		trav->tblk = nei_tblk;
+		trav->bt = nei;
+	}
+
+	ret = 0;
+out:
+	return ret;
+}
+
+/*
+ * Merge items from a neighboring block into our block.  This is only
+ * called if there is a parent block so there must be at least one
+ * neighbor.
+ *
+ * Our block can be on either spine of the tree so we need to be able to
+ * pull from a neighbor on either side.  We have to update the key in
+ * the parent reference item that separates the items in the two child
+ * blocks, regardless.
+ */
+static int merge_block(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+		       struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+		       struct traversal_blocks *trav)
+{
+	struct ngnfs_btree_item *nei_ref_item;
+	struct ngnfs_btree_item *ref_item;
+	struct ngnfs_txn_block *nei_tblk;
+	struct ngnfs_btree_block *nei;
+	struct ngnfs_block_ref ref;
+	bool until_balanced;
+	bool to_right;
+	u64 bnr;
+	int ret;
+
+	/* find our and neighboring ref items */
+	ref_item = search_next_item(trav->parent, &trav->bt->last);
+	BUG_ON(!ref_item);
+
+	nei_ref_item = next_item(trav->parent, ref_item);
+	if (nei_ref_item) {
+		to_right = false;
+	} else {
+		nei_ref_item = prev_item(trav->parent, ref_item);
+		BUG_ON(!nei_ref_item); /* must have nei when we have parent */
+		to_right = true;
+	}
+
+	/* get neighboring block */
+	copy_ref(&ref, nei_ref_item);
+	bnr = le64_to_cpu(ref.bnr);
+	ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_WRITE, &nei_tblk, (void **)&nei);
+	if (ret < 0)
+		goto out;
+
+	/* balance items between blocks if together they're both above threshold */
+	until_balanced = (le16_to_cpu(trav->bt->total_free) + le16_to_cpu(nei->total_free)) >
+			 (NGNFS_BTREE_MERGE_FREE_THRESH * 2);
+
+	/* expand our range so we can insert nei's items without triggering assertions */
+	if (to_right)
+		ngnfs_tblk_assign(trav->tblk, trav->bt->first, nei->first);
+	else
+		ngnfs_tblk_assign(trav->tblk, trav->bt->last, nei->last);
+
+	move_items(trav->tblk, trav->bt, nei_tblk, nei, to_right, until_balanced);
+
+	/* if nei has items then use separator to update ranges, and update its parent ref */
+	if (nei->nr_items != 0) {
+		if (to_right) {
+			reset_key_range_boundary(nei_tblk, nei, trav->tblk, trav->bt);
+			ngnfs_tblk_assign(trav->parent_tblk, nei_ref_item->key, nei->last);
+		} else {
+			reset_key_range_boundary(trav->tblk, trav->bt, nei_tblk, nei);
+		}
+	}
+
+	/* update our parent ref if our last changed */
+	if (!to_right)
+		ngnfs_tblk_assign(trav->parent_tblk, ref_item->key, trav->bt->last);
+
+	/* delete ref to empty neighbor, maybe free parent with single item */
+	if (nei->nr_items == 0) {
+		delete_item(trav->parent_tblk, trav->parent, nei_ref_item);
+		ret = check_free_root_block(nfi, txn, root_tblk, root, trav);
+		if (ret < 0)
+			goto out;
+	}
+
+	ret = 0;
+out:
+	return ret;
+}
+
+/*
+ * Ensure that the traversal's bt block will maintain the btree
+ * invariant after inserting or deleting an item with the given
+ * val_size.  We're promising the caller that they will be able to
+ * insert or delete if we return success.
+ *
+ * We split if inserting an item with the given val size doesn't fit in
+ * the block.  We merge if deleting an item of the given val_size would
+ * bring the utilization of the block under the merge threshold.  We
+ * also compact if we did neither and compaction would make room for an
+ * insertion.
+ *
+ * The caller can tell us to return denied if we would have split/merged
+ * but they didn't want us to.  This saves the caller from having to
+ * test the split/merge conditions before calling.
+ *
+ * Returns < 0 on error, 0 if nothing was done, and > 0 with the TSM_
+ * indications of what happened.  The caller can check for DENIED and
+ * then use >0 to determine that the items changed (and they can't trust
+ * previously held item pointers).
+ */
+enum {
+	TSM_SPLIT_MERGED = 1,
+	TSM_COMPACTED,
+	TSM_DENIED,
+};
+static int try_split_merge(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			   struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+			   struct traversal_blocks *trav, struct ngnfs_btree_key *key,
+			   size_t val_size, bool deny)
+{
+	bool splitting;
+	bool merging;
+	u64 bnr;
+	int ret;
+
+	splitting = should_split(trav->bt, val_size);
+	merging = !splitting && trav->parent && should_merge(trav->bt, val_size);
+
+	if (splitting || merging) {
+		if (deny) {
+			ret = TSM_DENIED;
+			goto out;
+		}
+		/* try to convert parent and block access to write, may retry */
+		if (trav->parent) {
+			bnr = le64_to_cpu(trav->parent->bnr);
+			ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_WRITE, &trav->parent_tblk,
+						  (void **)&trav->parent);
+			if (ret < 0)
+				goto out;
+		}
+		bnr = le64_to_cpu(trav->bt->bnr);
+		ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_WRITE, &trav->tblk,
+					  (void **)&trav->bt);
+		if (ret < 0)
+			goto out;
+
+		if (splitting)
+			ret = split_block(nfi, txn, root_tblk, root, trav, key);
+		else
+			ret = merge_block(nfi, txn, root_tblk, root, trav);
+		if (ret < 0)
+			goto out;
+		ret = TSM_SPLIT_MERGED;
+
+	} else if (should_compact(trav->bt, val_size)) {
+		compact_items(trav->tblk, trav->bt);
+		ret = TSM_COMPACTED;
+
+	} else {
+		ret = 0;
+	}
+
+out:
+	return ret;
+}
+
+/*
+ * This doesn't store block refs in traversable_blocks because the
+ * readers don't need parents nor write txn block pointers for
+ * modification.
+ */
+static int readable_leaf(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			 struct ngnfs_btree_root *root, struct ngnfs_btree_block **btp,
+			 struct ngnfs_btree_key *key)
+{
+	struct ngnfs_btree_item *item;
+	struct ngnfs_btree_block *bt;
+	struct ngnfs_block_ref ref;
+	int level;
+	u64 bnr;
+	int ret;
+
+	ref = root->ref;
+	bt = NULL;
+
+	for (level = root->height - 1; level >= 0; level--) {
+		bnr = le64_to_cpu(ref.bnr);
+		ret = ngnfs_txn_get_block(nfi, txn, bnr, NBF_READ, NULL, (void **)&bt);
+		if (ret < 0)
+			goto out;
+
+		if (level > 0) {
+			item = search_next_item(bt, key);
+			if (!item) {
+				/* XXX corruption, parents must always have child ref */
+				ret = -EIO;
+				goto out;
+			}
+
+			/* XXX relies on block verification */
+			copy_ref(&ref, item);
+		}
+	}
+
+	ret = 0;
+out:
+	if (ret < 0)
+		bt = NULL;
+	*btp = bt;
+
+	return ret;
+}
+
+/*
+ * Walk the btree to a leaf block that contains the given key, setting
+ * the caller's traversal parent and bt to point to the leaf and its
+ * parent.  Can return success and have both null pointers when the tree
+ * is empty.  We split and merge the parents such that the caller can
+ * split or merge the leaf once before needing to walk the tree again to
+ * split and merge parents.
+ */
+static int writable_leaf(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			 struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+			 struct traversal_blocks *trav, struct ngnfs_btree_key *key)
+{
+	struct ngnfs_btree_item *item;
+	struct ngnfs_block_ref ref;
+	int level;
+	nbf_t nbf;
+	u64 bnr;
+	int ret;
+
+	init_traversal_blocks(trav);
+
+	ref = root->ref;
+	for (level = root->height - 1; level >= 0; level--) {
+		/* start by getting read access to parents, write to only leaf */
+		nbf = level == 0 ? NBF_WRITE : NBF_READ;
+		bnr = le64_to_cpu(ref.bnr);
+		ret = ngnfs_txn_get_block(nfi, txn, bnr, nbf, &trav->tblk, (void **)&trav->bt);
+		if (ret < 0)
+			goto out;
+
+		if (level == 0)
+			break;
+
+		/* ensure that parent is prepared for child split/merge */
+		ret = try_split_merge(nfi, txn, root_tblk, root, trav, key,
+				      sizeof(struct ngnfs_block_ref), false);
+		if (ret < 0)
+			goto out;
+
+		item = search_next_item(trav->bt, key);
+		if (!item) {
+			/* XXX corruption, must always have child <= key */
+			ret = -EIO;
+			goto out;
+		}
+
+		/* XXX relies on block verification */
+		copy_ref(&ref, item);
+		trav->parent_tblk = trav->tblk;
+		trav->parent = trav->bt;
+		trav->tblk = NULL;
+		trav->bt = NULL;
+	}
+
+	ret = 0;
+out:
+	if (ret < 0)
+		init_traversal_blocks(trav);
+
+	return ret;
+}
+
+void ngnfs_btree_key_inc(struct ngnfs_btree_key *key)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(key->k); i++) {
+		le64_add_cpu(&key->k[i], 1);
+		if (key->k[i])
+			break;
+	}
+}
+
+void ngnfs_btree_key_set_min(struct ngnfs_btree_key *key)
+{
+	*key = min_key;
+}
+
+bool ngnfs_btree_key_is_min(struct ngnfs_btree_key *key)
+{
+	return compare_keys(key, &min_key) == 0;
+}
+
+void ngnfs_btree_key_set_max(struct ngnfs_btree_key *key)
+{
+	*key = max_key;
+}
+
+bool ngnfs_btree_key_is_max(struct ngnfs_btree_key *key)
+{
+	return compare_keys(key, &max_key) == 0;
+}
+
+/*
+ * A read only traversal through the items found in a leaf block from
+ * the given key.  We hold on to read access of all the parent blocks
+ * that we descend through in case we need to retry.
+ *
+ * If the last key is specified then it will be the last possible item
+ * that can be called with the iterator fn.
+ *
+ * If @next is non-null then it is set on return to the key that can be
+ * provided to continue iteration.  If it is the min key then iteration
+ * is done.
+ *
+ * This limits the number of leaf blocks that will be traversed in one
+ * call to limit the number of blocks referenced by the caller's
+ * transaction.  We somewhat arbitrarily chose the number of blocks.
+ * Even just two blocks can use twice the height if they straddle the
+ * edge of substrees divided by the first parents.  Additional blocks
+ * beyond that don't substantially increase the worst case number of
+ * blocks referenced.
+ */
+int ngnfs_btree_read_iter(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			  struct ngnfs_btree_root *root, struct ngnfs_btree_key *key,
+			  struct ngnfs_btree_key *next, struct ngnfs_btree_key *last,
+			  ngnfs_btree_read_iter_fn_t iter, void *iter_arg)
+{
+	struct ngnfs_btree_item *item;
+	struct ngnfs_btree_block *bt;
+	struct ngnfs_btree_key pos;
+	int leaf_limit = 4;
+	int ret;
+
+	if (next)
+		ngnfs_btree_key_set_min(next);
+	pos = *key;
+
+	for (;;) {
+		ret = readable_leaf(nfi, txn, root, &bt, &pos);
+		if (ret < 0 || bt == NULL) /* null bt is catching empty tree */
+			goto out;
+
+		for (item = search_next_item(bt, key); item; item = next_item(bt, item)) {
+			if (last && compare_keys(&item->key, last) > 0) {
+				ret = 0;
+				goto out;
+			}
+
+			ret = iter(&item->key, item->val, le16_to_cpu(item->val_size), iter_arg);
+			if (ret != NGNFS_BTREE_ITER_CONTINUE)
+				goto out;
+		}
+
+		/* done if block contained last key */
+		if ((last && compare_keys(&bt->last, last) >= 0) ||
+		    (!last && ngnfs_btree_key_is_max(&bt->last))) {
+			ret = 0;
+			goto out;
+		}
+
+		/* continue on to next leaf */
+		pos = bt->last;
+		ngnfs_btree_key_inc(&pos);
+
+		/* but finish if leaf limit reached */
+		if (--leaf_limit == 0) {
+			if (next)
+				*next = pos;
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	return ret;
+}
+
+/*
+ * Modify items in the btree at the instruction of the caller's iterator
+ * callback.  We call the iterator for every item within the caller's
+ * range.
+ *
+ * The callback can set its op argument on return to tell us to delete
+ * the existing iterated item or to insert an item before the iterated
+ * item.
+ *
+ * The iterator will always be called on the final key in the range.  If
+ * an item doesn't exist with that key then the item value argument for
+ * the callback will be NULL and the size will be 0.
+ *
+ * Traversal to the leaf only ensures that the parent have enough items
+ * or free space to maintain the btree invariant after one split/merge.
+ * If iteration needs to split or merge again it will back off and
+ * traverse again.
+ *
+ * XXX today it's up to the caller to know to only call with modifications
+ * that will fit in a very small number of leaves.  We'll want to expand this
+ * a bit to provide a key for continuing iteration.
+ */
+int ngnfs_btree_write_iter(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
+			   struct ngnfs_txn_block *root_tblk, struct ngnfs_btree_root *root,
+			   struct ngnfs_btree_key *key, struct ngnfs_btree_key *last,
+			   ngnfs_btree_write_iter_fn_t iter, void *iter_arg)
+{
+	struct ngnfs_btree_item *item;
+	struct ngnfs_btree_item *prev;
+	struct ngnfs_btree_item *next;
+	struct traversal_blocks trav;
+	struct ngnfs_btree_key pos;
+	struct ngnfs_btree_op op;
+	bool deny_split_merge;
+	int ret;
+
+	pos = *key;
+
+	for (;;) {
+		deny_split_merge = false;
+		ret = writable_leaf(nfi, txn, root_tblk, root, &trav, &pos);
+		if (ret < 0)
+			goto out;
+
+
+		/*
+		 * While iterating we maintain prev/next as items that
+		 * surround insertion.  We use the item pointer to
+		 * record if we're calling with a null final item at the
+		 * caller's last key value to end iteration.  We don't
+		 * use the res parent or link.
+		 */
+		if (trav.bt) {
+			next = search_next_prev_item(trav.bt, &pos, &prev);
+		} else {
+			prev = NULL;
+			next = NULL;
+		}
+
+		for (;;) {
+			/* advance to next leaf when it has items within caller last */
+			if (!next && trav.bt && compare_keys(&trav.bt->last, last) < 0) {
+				pos = trav.bt->last;
+				ngnfs_btree_key_inc(&pos);
+				break;
+			}
+
+			/* don't call on items past last */
+			item = next;
+			if (item && compare_keys(&item->key, last) > 0)
+				item = NULL;
+
+			memset(&op, 0, sizeof(struct ngnfs_btree_op));
+			if (item)
+				ret = iter(&item->key, item->val, le16_to_cpu(item->val_size),
+					   iter_arg, &op);
+			else
+				ret = iter(last, NULL, 0, iter_arg, &op);
+			if (ret != NGNFS_BTREE_ITER_CONTINUE)
+				goto out;
+
+			if (WARN_ON_ONCE(op.delete && !item)) {
+				ret = -ENOENT;
+				goto out;
+			}
+
+			/* alloc new leaf block if tree is empty */
+			if (op.insert && !trav.bt) {
+				ret = alloc_root_block(nfi, txn, root_tblk, root,
+						       &trav.tblk, &trav.bt);
+				if (ret < 0)
+					goto out;
+			}
+
+			if (op.delete) {
+				op.key = item->key;
+				op.val_size = le16_to_cpu(item->val_size);
+			}
+
+			if (op.insert || op.delete) {
+				ret = try_split_merge(nfi, txn, root_tblk, root, &trav,
+						      &op.key, op.val_size, deny_split_merge);
+				if (ret < 0)
+					goto out;
+				if (ret == TSM_DENIED) {
+					/* rewalk to leaf so we can split/merge again */
+					if (item)
+						pos = item->key;
+					else
+						pos = trav.bt->last;
+					break;
+				}
+				if (ret > 0) {
+					if (ret == TSM_SPLIT_MERGED)
+						deny_split_merge = true;
+					next = search_next_prev_item(trav.bt, &pos, &prev);
+					if (item)
+						item = next;
+				}
+			}
+
+			if (op.insert) {
+				prev = insert_item_between(trav.tblk, trav.bt, &op.key, op.val,
+							       op.val_size, prev, next);
+			} else if (op.delete) {
+				next = next_item(trav.bt, item);
+				delete_item(trav.tblk, trav.bt, item);
+				ret = check_free_root_block(nfi, txn, root_tblk, root, &trav);
+				if (ret < 0)
+					goto out;
+			} else if (item) {
+				prev = item;
+				next = next_item(trav.bt, prev);
+			} else {
+				/* done after calling iter with last */
+				ret = 0;
+				goto out;
+			}
+		}
+	}
+
+	ret = 0;
+out:
+	return ret;
 }
