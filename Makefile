@@ -22,6 +22,13 @@ DEP := $(foreach d,$(DIR),$(wildcard $(d)/*.d))
 # source with main() is linked as a binary
 BIN := $(patsubst %.c,%,$(shell grep -l "^int main" $(SRC)))
 
+# make a static library out of everything in shared
+LIB := lib/libngnfs.a
+LIB_DIR := shared shared/lk
+LIB_SRC := $(foreach d,$(LIB_DIR),$(wildcard $(d)/*.c))
+LIB_OBJ := $(patsubst %.c,%.o,$(LIB_SRC))
+LIB_DEP := $(foreach d,$(LIB_DIR),$(wildcard $(d)/*.d))
+
 # binary names have ngnfs- prefixed
 #binname = $(dir $1)ngnfs-$(notdir $1)
 
@@ -29,7 +36,7 @@ BIN := $(patsubst %.c,%,$(shell grep -l "^int main" $(SRC)))
 GCH := $(patsubst %,%.gch,$(wildcard shared/format-*.h))
 
 .PHONY: all
-all: shared/generated-trace-inlines.h $(GCH) $(BIN)
+all: shared/generated-trace-inlines.h $(GCH) $(BIN) $(LIB)
 
 ifneq ($(DEP),)
 -include $(DEP)
@@ -49,6 +56,10 @@ $(BIN): %: %.o 	$$(filter $$(dir %)$$(PERCENT),$$(OBJ)) \
 	gcc $(CFLAGS) -MD -MP -MF $*.d -c $< -o $*.o
 	./scripts/sparse.sh -Wbitwise -D__CHECKER__ $(CFLAGS) $<
 
+$(LIB): $(LIB_OBJ) Makefile
+	ar rcs $@ $(LIB_OBJ)
+	ranlib $@
+
 $(GCH): %.h.gch: %.h Makefile
 	gcc $(CFLAGS) -Wpadded -c $< -o $@
 
@@ -58,7 +69,7 @@ shared/generated-trace-inlines.h: scripts/generate-trace-events.awk \
 
 .PHONY: clean
 clean:
-	@rm -f $(BIN) $(OBJ) $(DEP) $(GCH) \
+	@rm -f $(BIN) $(LIB) $(OBJ) $(DEP) $(GCH) \
 		$(foreach d,$(DIR),$(wildcard $(d)/*.[is])) \
 		shared/generated-trace-inlines.h \
 		.sparse.gcc-defines.h .sparse.output

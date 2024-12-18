@@ -7,3 +7,4 @@ shared/generated-trace-inlines.h
 cli/ngnfs-cli
 devd/ngnfs-devd
 mapd/ngnfs-mapd
+lib/libngnfs.a
