@@ -1,32 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
-/*
- * This block cache layer is responsible for providing read and write
- * access to blocks which are transferred over an underlying transport
- * -- typically either over the network or over a local block IO
- * transport.
- *
- * Cached blocks are indexed in a hash table with block lifetimes
- * governed by RCU.  Clean cached blocks can be reclaimed at any time.
- *
- * Callers dirty blocks in dependent groups.  We maintain this grouping
- * by tracking dirty blocks in sets.  Dirty sets can be merged if their
- * blocks are modified in one dirty operation.
- *
- * Writeback is performed in terms of sets, in the order that they were
- * initially dirtied.  Background memory pressure or explicit cache sync
- * operations can trigger writeback.
- *
- * XXX:
- *  - This doesn't yet support exclusive read and write references.
- *    Some callers won't have serialization of operations do we'll be
- *    implementing serialization down in the blocks.  If it works out,
- *    anyway.
- *  - We'll need some form of shrinking.  We'll want some form of access
- *    marking so that we don't throw away recently used blocks without
- *    also creating a ton of contention.
- */
-
 #include "shared/lk/atomic.h"
 #include "shared/lk/barrier.h"
 #include "shared/lk/bitops.h"
@@ -39,7 +12,6 @@
 #include "shared/lk/list.h"
 #include "shared/lk/llist.h"
 #include "shared/lk/minmax.h"
-#include "shared/lk/processor.h"
 #include "shared/lk/rcupdate.h"
 #include "shared/lk/rhashtable.h"
 #include "shared/lk/wait.h"
@@ -48,52 +20,90 @@
 #include "shared/format-block.h"
 #include "shared/fs_info.h"
 #include "shared/block.h"
-#include "shared/urcu.h"
 #include "shared/trace.h"
 
 /*
- * Tasks stop dirtying additional blocks once this many blocks are
- * dirty.  Sets have to complete writeback and mark their blocks clean
- * before more blocks can be dirtied.
+ * This block cache coordinates block state between transaction users
+ * and the underlying block transport.
+ *
+ * Cached blocks are tracked in an rcu hash table.  Transaction users
+ * get read and write references to access and modify block contents.
+ * Read references are shared with readers and a single write reference
+ * is exclusive.
+ *
+ * Write references leave behind dirty blocks, which are later submitted
+ * to the block transport for writing.  Read references are allowed
+ * while blocks are being written but writes are excluded.
+ *
+ * There are some very simple thresholds on the number of dirty blocks
+ * at which start background flushing writes or limit the total number
+ * of dirty blocks.
+ *
+ * Today there are no atomic write transactions.  Dirty blocks are added
+ * to a flush list and are written, and can fail, independently.  This
+ * will change as the network protocol adds support for distributed
+ * transactions.  The cache will need to track atomic units of dirty
+ * blocks and hand them to the transport which can describe the group in
+ * write messages sent over the wire.
+ *
+ * Without the cache coherency network protocol this is missing a huge
+ * portion of its functionality.  It will need to track granted access
+ * when satisfying reference requests, and will need to respond to
+ * access revocation messages over the wire.
+ *
+ * When implementing invalidations and atomic writes, there's an
+ * irritating deadlock to address.  Transactions are tracking their
+ * block references so they can use trylock semantics to acquire
+ * references (and request access over the network) out of order and be
+ * asked to retry in order when they hit a potential deadlock. Write
+ * references might pin entire existing dirty atomic block sets, not
+ * just individual blocks.  This effectively means that transactions are
+ * also holding references to all the blocks in the dirty set, without
+ * knowing it.  They could block on a reference in order with their
+ * transaction blocks but out of order with respect to the dirty blocks
+ * that are pinned.  (One fix might be to have invalidations wake
+ * blocked reference acquisitions that pin the set.  We'll see what
+ * seems least awful.)
+ */
+
+/*
+ * Callers will wait to enter their write transaction until the number
+ * of dirty blocks falls below this limit.  They can exceed the limit
+ * while they're dirtying blocks in their transaction.
  */
 #define DIRTY_LIMIT	1024
 
 /*
- * Writeback will start when the number of dirty blocks exceeds this
+ * Background flushing will start when the number of dirty blocks exceeds this
  * threshold.
  */
-#define WRITEBACK_THRESH	256
+#define FLUSH_THRESH	256
 
 /*
- * The maximum number of blocks in a dirty set.  This is effectively
- * also the limit of the number of blocks that can be modified in a
- * transaction.  Attempts to add more dirty blocks to a full set will
- * write it out.
+ * Stages in the block processing pipeline gather inputs from multiple
+ * producers on a lockless list for a single work consumer to manage
+ * with a private list_head list.
  */
-#define SET_LIMIT	64
+struct block_work_list {
+	struct llist_head llist;
+	struct list_head list;
+	struct workqueue_struct *wq;
+	struct work_struct work;
+};
 
 struct ngnfs_block_info {
+	struct ngnfs_fs_info *nfi;
 	struct rhashtable ht;
 
 	int queue_depth;
 	atomic_t nr_dirty;
-	atomic_t nr_writeback;
+	atomic_t nr_flushing;
 	atomic_t nr_submitted;
 	atomic_t sync_waiters;
 
-	atomic64_t dirty_seq;
-	atomic64_t writeback_seq;
-	atomic64_t sync_seq;
-
-	struct llist_head submit_llist;
-	struct list_head submit_list;
-	struct llist_head writeback_llist;
-	struct list_head writeback_list;
-
-	struct ngnfs_fs_info *nfi;
-	struct workqueue_struct *wq;
-	struct work_struct submit_work;
-	struct work_struct writeback_work;
+	struct block_work_list flush;
+	struct block_work_list submit;
+	struct block_work_list clean;
 
 	struct ngnfs_block_transport_ops *btr_ops;
 	void *btr_info;
@@ -101,52 +111,15 @@ struct ngnfs_block_info {
 	wait_queue_head_t waitq;
 };
 
-/*
- * Dirty blocks are grouped into sets of blocks whose modifications
- * depend on each other and which must all be written atomically.   The
- * sets have a maximum number of blocks and will be merged when
- * an operation modifies blocks in different sets.
- */
-struct ngnfs_block_set {
-	struct rcu_head rcu;
-	atomic_t refcount;
-	atomic_t submitted_blocks;
-	struct llist_node writeback_llnode;
-	struct list_head writeback_head;
-	struct list_head block_list;
-	wait_queue_head_t waitq;
-	u64 dirty_seq;
-	unsigned long bits; /* SET_ set bits */
-	unsigned size;
-};
-
-enum {
-	/*
-	 * The exclusive setter of the bit is dirtying the blocks in the
-	 * set and possibly merging it with other sets.  Other dirtying
-	 * or writeback attempts will wait.
-	 */
-	SET_DIRTYING = 0,
-	/*
-	 * The set contains modified dirty blocks.  It's dirty blocks
-	 * are contributing to nr_dirty and its writeback seq has been
-	 * set by addition to the writeback llist.
-	 */
-	SET_DIRTY,
-	/*
-	 * The blocks in the set are under IO.  Dirtying attempts will wait.
-	 */
-	SET_WRITEBACK,
-};
-
 struct ngnfs_block {
-	struct ngnfs_block_set *set;
 	atomic_t refcount;
+	atomic_t rw_count;
 	struct rcu_head rcu;
 	struct rhash_head rhead;
+	struct llist_node dirty_llnode;
+	struct list_head dirty_head;
 	struct llist_node submit_llnode;
 	struct list_head submit_head;
-	struct list_head set_head;
 	wait_queue_head_t waitq;
 	unsigned long bits; /* BL_ block bits */
 	int error;
@@ -156,10 +129,10 @@ struct ngnfs_block {
 
 enum {
 	/*
-	 * Set between when a block is queued for reading IO and when IO
-	 * finishes.
+	 * An IO is in flight.  Set when added to the submit list and
+	 * cleared by the end_io callback.
 	 */
-	BL_READING = 0,
+	BL_IO_PENDING = 0,
 	/*
 	 * Set as reads complete and indicates that the current contents
 	 * are in sync with the persistent block.  Readers and writers
@@ -167,34 +140,46 @@ enum {
 	 */
 	BL_UPTODATE,
 	/*
-	 * IO failed.  Will be removed from the cache once all
+	 * IO failed.  The block will be removed from the cache once all
 	 * references get a chance to return the error and put their
 	 * reference.
 	 */
 	BL_ERROR,
 	/*
-	 * The block is present in a set of dirty blocks.
+	 * The block is dirty and must be written before it can be
+	 * freed.  It makes its way through the flush, submit, and clean
+	 * work.
 	 */
 	BL_DIRTY,
+	/*
+	 * This block only exists to track a sync waiters ordering with
+	 * dirty blocks in the flush and clean lists.
+	 */
+	BL_SYNC_WAITER,
 };
 
-/* declaring these as we want their wake logic along side the work logic */
+/* declaring these here so that we can have their wake condition along side their work */
+static void try_queue_flush_work(struct ngnfs_block_info *blinf);
 static void try_queue_submit_work(struct ngnfs_block_info *blinf);
-static void try_queue_writeback_work(struct ngnfs_block_info *blinf);
+static void queue_clean_work(struct ngnfs_block_info *blinf);
 
-static inline void clear_bit_and_wake_up(int nr, unsigned long *bits, wait_queue_head_t *wq)
+static void init_block_work_list(struct block_work_list *worklist, work_func_t func)
 {
-	if (test_and_clear_bit(nr, bits)) {
-		smp_mb(); /* store clear before loading waitq */
-		if (waitqueue_active(wq))
-			wake_up(wq);
-	}
+	init_llist_head(&worklist->llist);
+	INIT_LIST_HEAD(&worklist->list);
+	worklist->wq = NULL;
+	INIT_WORK(&worklist->work, func);
+}
+
+static void destroy_block_work_list(struct block_work_list *worklist)
+{
+	if (worklist->wq)
+		destroy_workqueue(worklist->wq);
 }
 
 static void free_block(struct ngnfs_block *bl)
 {
 	if (!IS_ERR_OR_NULL(bl)) {
-		BUG_ON(!list_empty(&bl->set_head));
 		BUG_ON(waitqueue_active(&bl->waitq));
 
 		if (bl->page)
@@ -203,7 +188,7 @@ static void free_block(struct ngnfs_block *bl)
 	}
 }
 
-static struct ngnfs_block *alloc_block(u64 bnr)
+static struct ngnfs_block *alloc_block(u64 bnr, bool with_page)
 {
 	struct ngnfs_block *bl;
 
@@ -215,14 +200,14 @@ static struct ngnfs_block *alloc_block(u64 bnr)
 		atomic_set(&bl->refcount, 1);
 		init_llist_node(&bl->submit_llnode);
 		INIT_LIST_HEAD(&bl->submit_head);
-		INIT_LIST_HEAD(&bl->set_head);
 		init_waitqueue_head(&bl->waitq);
 
-		bl->page = alloc_page(GFP_NOFS);
+		if (with_page)
+			bl->page = alloc_page(GFP_NOFS);
 		bl->bnr = bnr;
 	}
 
-	if (!bl || !bl->page) {
+	if (!bl || (with_page && !bl->page)) {
 		free_block(bl);
 		bl = ERR_PTR(-ENOMEM);
 	}
@@ -239,26 +224,52 @@ static void free_block_rcu(struct rcu_head *rcu)
 
 static void get_block(struct ngnfs_block *bl)
 {
-	atomic_inc(&bl->refcount);
+	int now = atomic_inc_return(&bl->refcount);
+
+	BUG_ON(now <= 0);
 }
 
 static void put_block(struct ngnfs_block *bl)
 {
-	if (!IS_ERR_OR_NULL(bl) && atomic_dec_return(&bl->refcount) == 0)
-		call_rcu(&bl->rcu, free_block_rcu);
+	int now = 0;
+
+	if (!IS_ERR_OR_NULL(bl)) {
+		now = atomic_dec_return(&bl->refcount);
+		if (now == 0)
+			call_rcu(&bl->rcu, free_block_rcu);
+		else
+			BUG_ON(now < 0);
+	}
 }
 
-static void get_set(struct ngnfs_block_set *set)
+/*
+ * Get read/write rw_count.  Concurrent readers increment the rw_count.
+ * An exclusive writer sets the rw_count from 0 to -1.  A caller's
+ * single read reference can be directly converted to a writer.
+ */
+static bool get_read_write(struct ngnfs_block *bl, nbf_t nbf)
 {
-	atomic_inc(&set->refcount);
+	BUG_ON(atomic_read(&bl->rw_count) < -1);
+	BUG_ON((nbf & NBF_CONVERT_WRITE) && atomic_read(&bl->rw_count) < 1);
+
+	if (nbf & NBF_CONVERT_WRITE)
+		return atomic_cmpxchg(&bl->rw_count, 1, -1) == 1;
+	else if (nbf & NBF_WRITE)
+		return atomic_cmpxchg(&bl->rw_count, 0, -1) == 0;
+	else
+		return atomic_inc_unless_negative(&bl->rw_count);
 }
 
-static void put_set(struct ngnfs_block_set *set)
+static void put_read_write(struct ngnfs_block *bl, nbf_t nbf)
 {
-	if (!IS_ERR_OR_NULL(set) && atomic_dec_return(&set->refcount) == 0) {
-		BUG_ON(!list_empty(&set->block_list));
-		BUG_ON(set->size != 0);
-		kfree_rcu(&set->rcu);
+	int now;
+
+	if (nbf & NBF_WRITE) {
+		now = atomic_inc_return(&bl->rw_count);
+		BUG_ON(now != 0);
+	} else {
+		now = atomic_dec_return(&bl->rw_count);
+		BUG_ON(now < 0);
 	}
 }
 
@@ -281,7 +292,7 @@ static void sync_waiters_set_error(struct ngnfs_block_info *blinf)
 
 	do {
 		old = atomic_read(&blinf->sync_waiters);
-	} while (old >= SYNC_WAITERS_INC &&
+	} while ((old >= SYNC_WAITERS_INC) && !(old & SYNC_WAITERS_ERR) &&
 		 (atomic_cmpxchg(&blinf->sync_waiters, old, old | SYNC_WAITERS_ERR) != old));
 }
 
@@ -291,7 +302,7 @@ static bool sync_waiters_has_error(struct ngnfs_block_info *blinf)
 }
 
 /*
- * Decrement the callers previous increment of sync_waiters, returning
+ * Decrement the caller's previous increment of sync_waiters, returning
  * -EIO if there was an error while they were waiting, and clearing the
  * error if they were the last waiter.
  */
@@ -311,43 +322,6 @@ static int sync_waiters_dec_error(struct ngnfs_block_info *blinf)
 	} while (atomic_cmpxchg(&blinf->sync_waiters, old, new) != old);
 
 	return ret;
-}
-
-/*
- * We have sequence numbers that record the order of sets being dirtied
- * and starting writeback.  We trigger writeback on behalf of the
- * caller's sync if their seqs haven't started writeback yet.  We then
- * wait for them to start and for there to be no more blocks in flight.
- *
- * We use a sort of latched sync error state.  While there are sync
- * waiters we record IO errors for all the waiters. Only once all the
- * waiters leave is the error cleared.
- *
- * Neither the livelocking of sync by new blocks entering writeback nor
- * the broadcasting of errors to all waiters are great, but it makes for
- * a simple initial implementation.
- */
-static int sync_up_to_seq(struct ngnfs_block_info *blinf, u64 seq)
-{
-	u64 sync_seq;
-
-	sync_waiters_inc(blinf);
-
-	do {
-		sync_seq = atomic64_read(&blinf->sync_seq);
-	} while (seq > sync_seq &&
-		 (atomic64_cmpxchg(&blinf->sync_seq, sync_seq, seq) != sync_seq));
-
-	if (seq > sync_seq)
-		try_queue_writeback_work(blinf);
-
-	trace_ngnfs_sync_begin(seq);
-
-	wait_event(&blinf->waitq, sync_waiters_has_error(blinf) ||
-		   (atomic64_read(&blinf->writeback_seq) >= seq &&
-		    atomic_read(&blinf->nr_writeback) == 0));
-
-	return sync_waiters_dec_error(blinf);
 }
 
 static const struct rhashtable_params ngnfs_block_ht_params = {
@@ -380,17 +354,16 @@ static struct ngnfs_block *lookup_or_alloc_block(struct ngnfs_block_info *blinf,
 
 	bl = lookup_block(blinf, bnr);
 	if (!bl) {
-		bl = alloc_block(bnr);
+		bl = alloc_block(bnr, true);
 		if (!IS_ERR(bl)) {
-			/* XXX can this found == bl? */
+			get_block(bl);
 			rcu_read_lock();
 			found = rhashtable_lookup_get_insert_fast(&blinf->ht, &bl->rhead,
 								  ngnfs_block_ht_params);
 			if (found) {
 				put_block(bl);
-				get_block(found);
+				put_block(bl);
 				bl = found;
-			} else {
 				get_block(bl);
 			}
 			rcu_read_unlock();
@@ -401,112 +374,70 @@ static struct ngnfs_block *lookup_or_alloc_block(struct ngnfs_block_info *blinf,
 }
 
 /*
- * If data_page is provided then it is a new page that the io transport
- * allocated to store an incoming read.  We swap it in to place and drop
- * the old (unused) block page.
- */
-static void end_read_io(struct ngnfs_block_info *blinf, struct ngnfs_block *bl,
-			struct page *data_page)
-{
-	if (data_page) {
-		/* this means that _block_buf() will change, callers beware */
-		if (bl->page)
-			put_page(bl->page);
-		bl->page = data_page;
-		get_page(bl->page);
-	}
-
-	if (!test_bit(BL_ERROR, &bl->bits))
-		set_bit(BL_UPTODATE, &bl->bits);
-
-	smp_wmb(); /* set error|uptodate before clearing reading */
-	clear_bit_and_wake_up(BL_READING, &bl->bits, &bl->waitq);
-}
-
-/*
- * Finish write IO on a block in a set.  Once all the blocks are written
- * we clear all the block's association with the set, clear its
- * dirtying, and put it.
- */
-static void end_write_io(struct ngnfs_block_info *blinf, struct ngnfs_block *bl)
-{
-	struct ngnfs_block_set *set = rcu_dereference(bl->set);
-	struct ngnfs_block *tmp;
-
-	/* caller called 'cause we weren't reading, should only be dirty writeback */
-	BUG_ON(IS_ERR_OR_NULL(set));
-	/* XXX not supporting write errors yet (keeping blocks dirty) */
-	BUG_ON(test_bit(BL_ERROR, &bl->bits));
-
-	/* each finished block gives room for more writeback in the queue depth */
-	atomic_dec(&blinf->nr_writeback);
-	try_queue_writeback_work(blinf);
-
-	if (atomic_dec_return(&set->submitted_blocks) > 0)
-		return;
-
-	atomic_sub(set->size, &blinf->nr_dirty);
-	set->size = 0;
-
-	/*
-	 * XXX This many barriers is a bummer, but the block's set
-	 * pointer is the serialization point for dirtying.  Once the
-	 * pointer is NULL another dirtier can set it and try to use the
-	 * set_head.
-	 */
-	list_for_each_entry_safe(bl, tmp, &set->block_list, set_head) {
-		list_del_init(&bl->set_head);
-		smp_wmb(); /* empty set_head before clearing set allows redirtying */
-		rcu_assign_pointer(bl->set, NULL);
-		/* XXX bl refcount? */
-	}
-
-	clear_bit_and_wake_up(SET_WRITEBACK, &set->bits, &set->waitq);
-	put_set(set);
-
-	/* finishing the whole set could wake sync or dirty waiters */
-	if (waitqueue_active(&blinf->waitq))
-		wake_up(&blinf->waitq);
-}
-
-/*
  * An incoming data_page ref is only used for reads. Writes always
- * manage source page that contains their written contents.
+ * manage source page that contains their written contents.  If a read
+ * data_page is provided then we swap it in to place and drop the old
+ * (unused) block page.
  */
 void ngnfs_block_end_io(struct ngnfs_fs_info *nfi, u64 bnr, struct page *data_page, int err)
 {
 	struct ngnfs_block_info *blinf = nfi->block_info;
 	struct ngnfs_block *bl;
+	bool is_write;
+	int nr_dirty;
 
 	/* XXX describe trying page granular pinning */
 
 	bl = lookup_block(blinf, bnr);
 	assert(!IS_ERR_OR_NULL(bl)); /* not supporting this failure yet */
+	is_write = !!test_bit(BL_DIRTY, &bl->bits);
 
-	/* XXX not sure what this means for writeback errors */
-	if (err < 0) {
-		set_bit(BL_ERROR, &bl->bits);
-		bl->error = err;
-		sync_waiters_set_error(blinf);
+	if (err) {
+		if (!test_and_set_bit(BL_ERROR, &bl->bits))
+			bl->error = err;
+		if (is_write)
+			sync_waiters_set_error(blinf);
 	}
 
-	if (test_bit(BL_READING, &bl->bits))
-		end_read_io(blinf, bl, data_page);
-	else
-		end_write_io(blinf, bl);
+	if (is_write) {
+		/* updating accounting here, clean work puts reader */
+		clear_bit(BL_DIRTY, &bl->bits);
+		nr_dirty = atomic_dec_return(&blinf->nr_dirty);
+	} else {
+		if (!test_bit(BL_ERROR, &bl->bits))
+			set_bit(BL_UPTODATE, &bl->bits);
 
+		if (data_page) {
+			/* this means that _block_buf() will change, callers beware */
+			if (bl->page)
+				put_page(bl->page);
+			bl->page = data_page;
+			get_page(bl->page);
+		}
+	}
+
+	clear_bit(BL_IO_PENDING, &bl->bits);
+	atomic_dec(&blinf->nr_submitted);
+
+	barrier(); /* RELEASE: all block updates visible before we queue/wake */
+
+	wake_up(&bl->waitq);
 	put_block(bl);
+
+	if (is_write) {
+		try_queue_flush_work(blinf);
+		queue_clean_work(blinf);
+		if (nr_dirty < DIRTY_LIMIT && waitqueue_active(&blinf->waitq))
+			wake_up(&blinf->waitq);
+	}
 }
 
 /*
- * Callers are gathering items that were concurrently appended to a
- * lockless list (llist) and putting them on a private list_head list
- * for private use.  We'd like to preserve list order so we walk the
- * llist lifo and construct a private fifo that is then spliced onto the
- * end of the caller's existing list.
- *
- * This doesn't remove/initialize the llist nodes.  The caller will do
- * that as they iterate over the items the private list.
+ * Callers are gathering items that were concurrently prepended to a
+ * lockless list and are putting them on their private list_head list.
+ * We preserve list order (for sync especially) so we walk the llist
+ * lifo and construct a private fifo that is then spliced onto the end
+ * of the caller's existing list.
  */
 static void del_all_reverse_add_tail(struct list_head *list, struct llist_head *llist,
 				     ssize_t offset)
@@ -527,190 +458,277 @@ static void del_all_reverse_add_tail(struct list_head *list, struct llist_head *
 }
 
 /*
- * The submit work is responsible for keeping the backend's queue depth
- * full.  This is only concerned with the IO submission pipeline,
- * callers (particularly batch submission preparation) manage higher
- * order concepts like atomic writes.
+ * XXX barriers?
+ */
+static void try_queue_submit_work(struct ngnfs_block_info *blinf)
+{
+	if ((!list_empty(&blinf->submit.list) || !llist_empty(&blinf->submit.llist)) &&
+	    (atomic_read(&blinf->nr_submitted) < blinf->queue_depth))
+		queue_work(blinf->submit.wq, &blinf->submit.work);
+}
+
+/*
+ * The submit work is responsible for keeping the transport's queue
+ * depth full.
  */
 static void ngnfs_block_submit_work(struct work_struct *work)
 {
-	struct ngnfs_block_info *blinf = container_of(work, struct ngnfs_block_info, submit_work);
+	struct ngnfs_block_info *blinf = container_of(work, struct ngnfs_block_info, submit.work);
 	struct ngnfs_fs_info *nfi = blinf->nfi;
 	struct ngnfs_block *tmp;
 	struct ngnfs_block *bl;
+	int submitted;
 	int space;
 	int ret;
 	int op;
 
-	del_all_reverse_add_tail(&blinf->submit_list, &blinf->submit_llist,
+	del_all_reverse_add_tail(&blinf->submit.list, &blinf->submit.llist,
 				 offsetof(struct ngnfs_block, submit_head) -
 				 offsetof(struct ngnfs_block, submit_llnode));
-	space = blinf->queue_depth - atomic_read(&blinf->nr_submitted);
 
-	list_for_each_entry_safe(bl, tmp, &blinf->submit_list, submit_head) {
-		if (space-- < 0)
+	space = blinf->queue_depth - atomic_read(&blinf->nr_submitted);
+	submitted = 0;
+
+	list_for_each_entry_safe(bl, tmp, &blinf->submit.list, submit_head) {
+		if (submitted == space)
 			break;
 
 		init_llist_node(&bl->submit_llnode);
 		list_del_init(&bl->submit_head);
 
-		/* XXX _GET_WRITE isn't operational yet */
-		op = test_bit(BL_READING, &bl->bits) ? NGNFS_BTX_OP_GET_READ : NGNFS_BTX_OP_WRITE;
+		/* XXX _GET_WRITE isn't implemented */
+		op = test_bit(BL_DIRTY, &bl->bits) ? NGNFS_BTX_OP_WRITE : NGNFS_BTX_OP_GET_READ;
 
-		atomic_inc(&blinf->nr_submitted);
 		ret = blinf->btr_ops->submit_block(nfi, blinf->btr_info, op, bl->bnr, bl->page);
 		BUG_ON(ret != 0);
 
-		put_block(bl);
+		submitted++;
 	}
+
+	if (submitted)
+		atomic_add(submitted, &blinf->nr_submitted);
 }
 
 /*
- * XXX These empty tests make me nervous.
+ * XXX barriers?
  */
-static void try_queue_submit_work(struct ngnfs_block_info *blinf)
-{
-	if ((!list_empty(&blinf->submit_list) || !llist_empty(&blinf->submit_llist)) &&
-	    (atomic_read(&blinf->nr_submitted) < blinf->queue_depth))
-		queue_work(blinf->wq, &blinf->submit_work);
-}
-
-/*
- * We submit dirty sets for writeback if either we're syncing sets that
- * haven't been written or sufficient dirty sets have accumulated and
- * there isn't a queue's depth worth of blocks currently in writeback.
- */
-static bool should_writeback(struct ngnfs_block_info *blinf)
+static int should_flush(struct ngnfs_block_info *blinf)
 {
 	int dirty = atomic_read(&blinf->nr_dirty);
-	int writeback = atomic_read(&blinf->nr_writeback);
+	int flushing = atomic_read(&blinf->nr_flushing);
+	int depth = blinf->queue_depth * 2;
 
-	return (atomic64_read(&blinf->sync_seq) > atomic64_read(&blinf->writeback_seq) ||
-		((dirty - writeback) >= WRITEBACK_THRESH)) &&
-	       (writeback < blinf->queue_depth);
+	if (dirty > FLUSH_THRESH && flushing < depth)
+		return depth - flushing;
+
+	if (atomic_read(&blinf->sync_waiters) >= SYNC_WAITERS_INC)
+		return dirty - flushing;
+
+	return 0;
 }
 
-static void try_queue_writeback_work(struct ngnfs_block_info *blinf)
+static void try_queue_flush_work(struct ngnfs_block_info *blinf)
 {
-	if (should_writeback(blinf))
-		queue_work(blinf->wq, &blinf->writeback_work);
+	if (should_flush(blinf))
+		queue_work(blinf->flush.wq, &blinf->flush.work);
 }
 
 /*
- * The writeback work is responsible for preparing sets for writeback
- * and sending their blocks to the submit work.  Today they're sent
- * directly but eventually we'll want to work with the transports to
- * prepare the blocks.
+ * The flush work is responsible for submitting write IO for dirty
+ * blocks on the flush list.  Today the blocks are passed straight
+ * through to the submit work.
+ *
+ * As write transactions are implemented this will be responsible for
+ * grouping the blocks into transaction fragments and for resending if
+ * the maps change.
  */
-static void ngnfs_block_writeback_work(struct work_struct *work)
+static void ngnfs_block_flush_work(struct work_struct *work)
 {
 	struct ngnfs_block_info *blinf = container_of(work, struct ngnfs_block_info,
-						      writeback_work);
-	struct ngnfs_block_set *set;
-	struct ngnfs_block_set *tmp;
+						      flush.work);
+	struct ngnfs_block *tmp;
 	struct ngnfs_block *bl;
+	bool submitted = false;
+	int should;
 
 	/* always gather dirtied sets from llist for iteration */
-	del_all_reverse_add_tail(&blinf->writeback_list, &blinf->writeback_llist,
-				 offsetof(struct ngnfs_block_set, writeback_head) -
-				 offsetof(struct ngnfs_block_set, writeback_llnode));
+	del_all_reverse_add_tail(&blinf->flush.list, &blinf->flush.llist,
+				 offsetof(struct ngnfs_block, dirty_head) -
+				 offsetof(struct ngnfs_block, dirty_llnode));
 
-	list_for_each_entry_safe(set, tmp, &blinf->writeback_list, writeback_head) {
-		if (!should_writeback(blinf))
-			break;
+	should = should_flush(blinf);
+	BUG_ON(should < 0);
 
-		/* back off if set is dirtying, we'll be queued after */
-		BUG_ON(test_bit(SET_WRITEBACK, &set->bits));
-		set_bit(SET_WRITEBACK, &set->bits);
-		smp_mb(); /* set writeback before testing dirtying */
-		if (test_bit(SET_DIRTYING, &set->bits)) {
-			clear_bit_and_wake_up(SET_WRITEBACK, &set->bits, &set->waitq);
-			wait_event(&set->waitq, !test_bit(SET_DIRTYING, &set->bits));
-			break;
+	list_for_each_entry_safe(bl, tmp, &blinf->flush.list, dirty_head) {
+		if (test_bit(BL_SYNC_WAITER, &bl->bits)) {
+			list_del_init(&bl->dirty_head);
+			llist_add(&bl->dirty_llnode, &blinf->clean.llist);
+			queue_clean_work(blinf);
+			continue;
 		}
 
-		/* list presence ref passes to end_io, get ref to protect block iteration */
-		list_del_init(&set->writeback_head);
-		if (set->size > 0) {
-			atomic_add(set->size, &blinf->nr_writeback);
-			atomic_add(set->size, &set->submitted_blocks);
-			get_set(set);
-			/*
-			 * Make sure nr_writeback is visible before
-			 * writeback_seq, and that the set is referenced
-			 * and has submitted_blocks for end_io via llist
-			 * presence.
-			 */
-			smp_wmb();
+		if (should-- == 0)
+			break;
 
-			list_for_each_entry(bl, &set->block_list, set_head) {
-				get_block(bl);
-				llist_add(&bl->submit_llnode, &blinf->submit_llist);
-			}
-			try_queue_submit_work(blinf);
-		}
+		/* get reader while flushing to exclude writers */
+		if (!get_read_write(bl, NBF_READ))
+			break;
 
-		atomic64_inc(&blinf->writeback_seq);
-		put_set(set);
+		list_del_init(&bl->dirty_head);
+		set_bit(BL_IO_PENDING, &bl->bits);
+		get_block(bl);
+		atomic_inc(&blinf->nr_flushing);
+
+		barrier(); /* release: order updates before visible on lists */
+
+		llist_add(&bl->dirty_llnode, &blinf->clean.llist);
+		llist_add(&bl->submit_llnode, &blinf->submit.llist);
+
+		submitted = true;
 	}
+
+	if (submitted)
+		try_queue_submit_work(blinf);
+}
+
+static void queue_clean_work(struct ngnfs_block_info *blinf)
+{
+	queue_work(blinf->clean.wq, &blinf->clean.work);
+}
+
+/*
+ * The clean work's only job is to walk the clean list and remove blocks
+ * whose write IO has completed.  We defer this after end_io so that we
+ * can put sync waiters in the flush->clean list and wake them once all
+ * the write IO they're waiting for is complete.
+ */
+static void ngnfs_block_clean_work(struct work_struct *work)
+{
+	struct ngnfs_block_info *blinf = container_of(work, struct ngnfs_block_info, clean.work);
+	struct ngnfs_block *tmp;
+	struct ngnfs_block *bl;
+	bool cleaned = false;
+
+	del_all_reverse_add_tail(&blinf->clean.list, &blinf->clean.llist,
+				 offsetof(struct ngnfs_block, dirty_head) -
+				 offsetof(struct ngnfs_block, dirty_llnode));
+
+	list_for_each_entry_safe(bl, tmp, &blinf->clean.list, dirty_head) {
+
+		if (test_bit(BL_IO_PENDING, &bl->bits))
+			break;
+
+		list_del_init(&bl->dirty_head);
+
+		if (test_bit(BL_SYNC_WAITER, &bl->bits)) {
+			clear_bit(BL_SYNC_WAITER, &bl->bits);
+		} else {
+			atomic_dec(&blinf->nr_flushing);
+			put_read_write(bl, NBF_READ);
+			cleaned = true;
+		}
+
+		wake_up(&bl->waitq);
+		put_block(bl);
+	}
+
+	if (cleaned)
+		try_queue_flush_work(blinf);
 }
 
 static bool bad_nbf(nbf_t nbf)
 {
-	return hweight_long(nbf & NBF_RW_EXCL) > 1;
+	return ((nbf & NBF_READ) && (nbf & NBF_WRITE)) ||
+	       ((nbf & (NBF_NEW | NBF_NODIRTY | NBF_CONVERT_WRITE)) && !(nbf & NBF_WRITE));
 }
 
 /*
  * Acquire a reference to a cached block.  The behaviour of the
- * reference is defined by the block flags as documented at the nbf_t
+ * reference is controlled by the flags as documented at the nbf_t
  * definition.  Successfully acquired references must later be released
  * by calling _put().
- *
- * This doesn't yet differentiate between exclusive read and write
- * references.
  */
 struct ngnfs_block *ngnfs_block_get(struct ngnfs_fs_info *nfi, u64 bnr, nbf_t nbf)
 {
 	struct ngnfs_block_info *blinf = nfi->block_info;
-	struct ngnfs_block *bl;
-	int err;
+	struct ngnfs_block *bl = NULL;
+	int ret;
 
 	if (WARN_ON_ONCE(bad_nbf(nbf))) {
-		bl = ERR_PTR(-EINVAL);
+		ret = -EINVAL;
 		goto out;
 	}
 
 	bl = lookup_or_alloc_block(blinf, bnr);
-	if (IS_ERR(bl))
+	if (IS_ERR(bl)) {
+		ret = PTR_ERR(bl);
 		goto out;
+	}
 
-	/* XXX also drop dirty?  hmm. */
-	if ((nbf & NBF_NEW)) {
-		memset(ngnfs_block_buf(bl), 0, NGNFS_BLOCK_SIZE);
+	if (!get_read_write(bl, nbf)) {
+		if (nbf & (NBF_TRY | NBF_CONVERT_WRITE)) {
+			ret = -EDEADLK;
+			goto out;
+		}
+		wait_event(&bl->waitq, get_read_write(bl, nbf));
+	}
+
+	/* new is used by writers to set uptodate without reading */
+	if (nbf & NBF_NEW) {
+		wait_event(&bl->waitq, !test_bit(BL_IO_PENDING, &bl->bits));
+		memset(ngnfs_block_buf(bl), 0, NGNFS_BLOCK_SIZE); /* XXX caller's job? */
 		set_bit(BL_UPTODATE, &bl->bits);
+		clear_bit(BL_ERROR, &bl->bits);
+		bl->error = 0;
 	}
 
 	if (!test_bit(BL_UPTODATE, &bl->bits)) {
-		if (!test_and_set_bit(BL_READING, &bl->bits)) {
+		if (!test_and_set_bit(BL_IO_PENDING, &bl->bits)) {
 			get_block(bl); /* presence on submit lists before hitting transport */
-			llist_add(&bl->submit_llnode, &blinf->submit_llist);
+			llist_add(&bl->submit_llnode, &blinf->submit.llist);
 			try_queue_submit_work(blinf);
 		}
 
-		wait_event(&bl->waitq, !test_bit(BL_READING, &bl->bits));
+		wait_event(&bl->waitq, !test_bit(BL_IO_PENDING, &bl->bits));
 	}
 
 	if (test_bit(BL_ERROR, &bl->bits)) {
-		err = bl->error;
-		put_block(bl);
-		bl = ERR_PTR(err);
+		ret = bl->error;
+		put_read_write(bl, nbf);
+	} else {
+		ret = 0;
 	}
+
 out:
+	if (ret < 0)  {
+		put_block(bl);
+		bl = ERR_PTR(ret);
+	}
+
 	return bl;
 }
 
-void ngnfs_block_put(struct ngnfs_block *bl)
+/*
+ * Release a block reference.  The nbf flags must start with matching
+ * the mode of the previously successful _get call but can add
+ * additional flags that change behaviour.  (We might want a more robust
+ * "holder" struct that flags then modify.)
+ */
+void ngnfs_block_put(struct ngnfs_fs_info *nfi, struct ngnfs_block *bl, nbf_t nbf)
 {
+	struct ngnfs_block_info *blinf = nfi->block_info;
+
+	if ((nbf & NBF_WRITE) && !test_bit(BL_DIRTY, &bl->bits) && !(nbf & NBF_NODIRTY)) {
+		set_bit(BL_DIRTY, &bl->bits);
+		get_block(bl);
+		atomic_inc(&blinf->nr_dirty);
+		/* XXX barrier? */
+		llist_add(&bl->dirty_llnode, &blinf->flush.llist);
+		try_queue_flush_work(blinf);
+	}
+
+	put_read_write(bl, nbf);
+	wake_up(&bl->waitq);
 	put_block(bl);
 }
 
@@ -725,285 +743,54 @@ struct page *ngnfs_block_page(struct ngnfs_block *bl)
 }
 
 /*
- * Get a reference to a block's set if it's different than the caller's.
- * If the block doesn't have a set then we either add it to the caller's
- * set or allocate a new set for it.  If we add it to the caller's set
- * then we return NULL.  Otherwise we return the block's (possibly newly
- * allocated) set with a reference held, or an err ptr.
+ * Wait until the number of dirty blocks is under the hard limit.
+ * There's no measures taken to avoid thundering herds, and once writers
+ * proceed past this wait they can each dirty their full transaction's
+ * worth of blocks.
  */
-static struct ngnfs_block_set *get_other_set(struct ngnfs_block *bl,
-					     struct ngnfs_block_set *existing)
-{
-	struct ngnfs_block_set *set;
-	struct ngnfs_block_set *tmp;
-
-	for (;;) {
-		/* return other referenced set, or null if block already in existing */
-		rcu_read_lock();
-		set = rcu_dereference(bl->set);
-		if (set && set != existing)
-			atomic_inc(&set->refcount);
-		rcu_read_unlock();
-		if (set) {
-			if (set == existing)
-				set = NULL;
-			break;
-		}
-
-		/* return null if we add to caller's existing set */
-		if (existing) {
-			tmp = unrcu_pointer(cmpxchg(&bl->set, RCU_INITIALIZER(NULL),
-						    RCU_INITIALIZER(existing)));
-			if (tmp == NULL) {
-				list_add_tail(&bl->set_head, &existing->block_list);
-				existing->size++;
-				break;
-			}
-
-			cpu_relax();
-			continue;
-		}
-
-		/* return newly allocated other set with ref or error */
-		set = kmalloc(sizeof(struct ngnfs_block_set), GFP_NOFS);
-		if (!set) {
-			set = ERR_PTR(-ENOMEM);
-			break;
-		}
-
-		atomic_set(&set->refcount, 2); /* caller and bl->set pointer */
-		atomic_set(&set->submitted_blocks, 0);
-		INIT_LIST_HEAD(&set->writeback_head);
-		INIT_LIST_HEAD(&set->block_list);
-		init_waitqueue_head(&set->waitq);
-		set->bits = 0;
-		set->size = 1;
-
-		list_add_tail(&bl->set_head, &set->block_list);
-
-		smp_wmb();  /* store initialized fields before setting block set pointer */
-		tmp = unrcu_pointer(cmpxchg(&bl->set, RCU_INITIALIZER(NULL),
-					    RCU_INITIALIZER(set)));
-		if (tmp == NULL)
-			break;
-
-		kfree(set);
-		cpu_relax();
-		continue;
-	}
-
-	return set;
-}
-
-/*
- * Some of the input blocks built up in the set might not have been
- * dirty.  If we're backing off from dirtying we remove those blocks
- * from the set.  This is done in rare contention cases or when a set
- * would have exceeded the size limit.
- */
-static void clear_set_dirtying(struct ngnfs_block_info *blinf, struct ngnfs_block_set *set)
-{
-	struct ngnfs_block *bl;
-	struct ngnfs_block *tmp;
-
-	list_for_each_entry_safe_reverse(bl, tmp, &set->block_list, set_head) {
-		if (test_bit(BL_DIRTY, &bl->bits))
-			break;
-		list_del_init(&bl->set_head);
-		smp_wmb(); /* setting set to null is like an unlock */
-		rcu_assign_pointer(bl->set, NULL);
-		set->size--;
-	}
-
-	clear_bit_and_wake_up(SET_DIRTYING, &set->bits, &set->waitq);
-	try_queue_writeback_work(blinf);
-}
-
-/*
- * _dirty_{begin,end} callers pass in a list of blocks in a weird way.
- * The caller passes in a list of private structs and the offset in each
- * struct to the block pointer for that list element.
- */
-#define for_each_dirty_list_block(bl, pos, list, off)					\
-	for (pos = list->next;								\
-	     (bl = (pos == list ? NULL : *(struct ngnfs_block **)((void *)pos + off)));	\
-	     pos = pos->next)
-
-/*
- * The caller has write references to the blocks that it wants to modify
- * together in one transaction.  We walk the blocks and attempt to merge
- * them into one set so that they can be modified and marked dirty.
- *
- * The caller's blocks may be found on multiple existing dirty sets.  As
- * we iterate over the blocks we try to merge each new block's set into
- * a single set.  When merging sets would exceed the set limit we write
- * out the larger of the two sets and try again.
- *
- * Caller's blocks might not yet be dirty.  If we have to write out
- * large sets before merging then we can remove the blocks that were
- * going to be modified but weren't dirty.
- *
- * We're racing with other threads dirtying sets or with the writeback
- * thread writing out sets.  The DIRTYING bit excludes both.
- */
-int ngnfs_block_dirty_begin(struct ngnfs_fs_info *nfi, struct list_head *list, ssize_t off)
+void ngnfs_block_dirty_limit_wait(struct ngnfs_fs_info *nfi)
 {
 	struct ngnfs_block_info *blinf = nfi->block_info;
-	struct ngnfs_block_set *small = NULL;
-	struct ngnfs_block_set *large = NULL;
-	struct ngnfs_block *bl = NULL;
-	struct list_head *pos;
-	u64 seq;
-	int ret;
-
-	/* maybe some txn pattern can end up harmlessly executing an empty txn */
-	if (list_empty(list))
-		return 0;
 
 	/* XXX probably interruptible, io errors won't clear dirty */
 	wait_event(&blinf->waitq, atomic_read(&blinf->nr_dirty) < DIRTY_LIMIT);
-
-restart:
-	put_set(small);
-	put_set(large);
-	small = NULL;
-	large = NULL;
-	for_each_dirty_list_block(bl, pos, list, off) {
-
-		/* initially "small" is the set from the next block */
-		put_set(small);
-		small = get_other_set(bl, large);
-		if (IS_ERR(small)) {
-			ret = PTR_ERR(small);
-			goto out;
-		}
-
-		/* block is already in our large set */
-		if (small == NULL)
-			continue;
-
-		/* wait until set is not being dirtied by someone else */
-		if (test_and_set_bit(SET_DIRTYING, &small->bits)) {
-			if (large)
-				clear_set_dirtying(blinf, large);
-			wait_event(&small->waitq, !test_bit(SET_DIRTYING, &small->bits));
-			goto restart;
-		}
-
-		smp_mb(); /* treat setting dirtying as a lock -- hard load/store barrier */
-
-		/* wait until set is not being written */
-		if (test_bit(SET_WRITEBACK, &small->bits)) {
-			clear_set_dirtying(blinf, small);
-			if (large)
-				clear_set_dirtying(blinf, large);
-			wait_event(&small->waitq, !test_bit(SET_WRITEBACK, &small->bits));
-			goto restart;
-		}
-
-		if (!large) {
-			/* found first block's set, carry on */
-			large = small;
-			small = NULL;
-			continue;
-		}
-
-		/*
-		 * Once we have both sets marked DIRTYING we correct the
-		 * small/large relationship.  We'll merge small's blocks
-		 * into large, and we'll wait for large to be written if
-		 * the merge exceeds the set size limit.
-		 */
-		if (small->size > large->size)
-			swap(small, large);
-
-		/* wait for writeback of large if merged size exceeds limit */
-		if (large->size + small->size > SET_LIMIT) {
-			seq = large->dirty_seq;
-			smp_mb(); /* finish with fields under DIRTYING before clearing */
-			clear_set_dirtying(blinf, small);
-			clear_set_dirtying(blinf, large);
-
-			/* XXX do we want txns to fail with io errors? */
-			ret = sync_up_to_seq(blinf, seq);
-			if (ret < 0)
-				goto out;
-			goto restart;
-		}
-
-		/* finally merge the smaller set into the larger */
-		list_for_each_entry(bl, &small->block_list, set_head)
-			rcu_assign_pointer(bl->set, large);
-		list_splice_init(&small->block_list, &large->block_list);
-		large->size += small->size;
-		small->size = 0;
-		clear_bit_and_wake_up(SET_DIRTY, &small->bits, &small->waitq);
-		clear_bit_and_wake_up(SET_DIRTYING, &small->bits, &small->waitq);
-		/* emptied small set will be freed once ref is put */
-	}
-
-	/* dirtying and modifying will succeed from this point */
-
-	/* make sure any newly added blocks are dirty */
-	list_for_each_entry_reverse(bl, &large->block_list, set_head) {
-		if (test_bit(BL_DIRTY, &bl->bits))
-			break;
-		set_bit(BL_DIRTY, &bl->bits);
-		atomic_inc(&blinf->nr_dirty);
-	}
-
-	/* initially mark set as dirty and establish its writeback position */
-	if (!test_and_set_bit(SET_DIRTY, &large->bits)) {
-		/* ref for writeback list presence (and probably through to end_io) */
-		get_set(large);
-		large->dirty_seq = atomic64_inc_return(&blinf->dirty_seq);
-		smp_wmb(); /* store ref get before allowing put via llist presence */
-		llist_add(&large->writeback_llnode, &blinf->writeback_llist);
-		try_queue_writeback_work(blinf);
-	}
-
-	/* pass our large ref on to _dirty_end to clear SET_DIRTYING and put */
-	large = NULL;
-	ret = 0;
-out:
-	put_set(small);
-	put_set(large);
-
-	return ret;
 }
 
 /*
- * The writer is done modifying all the blocks.  _dirty_begin put all
- * the blocks in one set so we just need to get the set from the first
- * block and clear dirtying.
- */
-void ngnfs_block_dirty_end(struct ngnfs_fs_info *nfi, struct list_head *list, ssize_t off)
-{
-	struct ngnfs_block_info *blinf = nfi->block_info;
-	struct ngnfs_block_set *set;
-	struct ngnfs_block *bl;
-	struct list_head *pos;
-
-	for_each_dirty_list_block(bl, pos, list, off) {
-		set = rcu_dereference(bl->set);
-		clear_bit_and_wake_up(SET_DIRTYING, &set->bits, &set->waitq);
-		put_set(set); /* from _dirty_begin */
-		break;
-	}
-
-	/* XXX hmm, it'd be nice to not always store here (test_and_set when queuing) */
-	try_queue_writeback_work(blinf);
-}
-
-/*
- * Attempt to write all blocks that were dirty at the time of the call,
- * returning errors from any write failures of those blocks.
+ * This sync blocks until previously dirty blocks are flushed and
+ * written out successfully.  It captures blocks that were dirtied by
+ * _put calls that returned before this _sync call started.
+ *
+ * The error tracking is pretty clumsy.  The first write error seen
+ * while any sync is waiting is returned to all waiting syncs.  It's
+ * goofy, but easy.
+ *
+ * The ordering between waiters and dirty blocks is achieved by having
+ * each waiter insert a fake block into the flush list.  It'll be woken
+ * once the clean work finds it in the clean list after all previously
+ * dirty blocks.
  */
 int ngnfs_block_sync(struct ngnfs_fs_info *nfi)
 {
 	struct ngnfs_block_info *blinf = nfi->block_info;
+	struct ngnfs_block *bl;
 
-	return sync_up_to_seq(blinf, atomic64_read(&blinf->dirty_seq));
+	bl = alloc_block(0, false);
+	if (IS_ERR(bl))
+		return PTR_ERR(bl);
+
+	set_bit(BL_SYNC_WAITER, &bl->bits);
+
+	sync_waiters_inc(blinf);
+
+	llist_add(&bl->dirty_llnode, &blinf->flush.llist);
+	try_queue_flush_work(blinf);
+
+	wait_event(&bl->waitq, sync_waiters_has_error(blinf) ||
+			       !(test_bit(BL_SYNC_WAITER, &bl->bits)));
+	put_block(bl);
+
+	return sync_waiters_dec_error(blinf);
 }
 
 int ngnfs_block_setup(struct ngnfs_fs_info *nfi, struct ngnfs_block_transport_ops *btr_ops,
@@ -1013,53 +800,55 @@ int ngnfs_block_setup(struct ngnfs_fs_info *nfi, struct ngnfs_block_transport_op
 	int ret;
 
 	blinf = kzalloc(sizeof(struct ngnfs_block_info), GFP_KERNEL);
-	if (!blinf)
-		return -ENOMEM;
+	if (!blinf) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
+	blinf->nfi = nfi;
 	atomic_set(&blinf->nr_dirty, 0);
-	atomic_set(&blinf->nr_writeback, 0);
+	atomic_set(&blinf->nr_flushing, 0);
 	atomic_set(&blinf->nr_submitted, 0);
 	atomic_set(&blinf->sync_waiters, 0);
-	atomic64_set(&blinf->dirty_seq, 0);
-	atomic64_set(&blinf->writeback_seq, 0);
-	atomic64_set(&blinf->sync_seq, 0);
-	init_llist_head(&blinf->submit_llist);
-	INIT_LIST_HEAD(&blinf->submit_list);
-	init_llist_head(&blinf->writeback_llist);
-	INIT_LIST_HEAD(&blinf->writeback_list);
-	blinf->nfi = nfi;
+	init_block_work_list(&blinf->flush, ngnfs_block_flush_work);
+	init_block_work_list(&blinf->submit, ngnfs_block_submit_work);
+	init_block_work_list(&blinf->clean, ngnfs_block_clean_work);
 	blinf->btr_ops = btr_ops;
-	INIT_WORK(&blinf->submit_work, ngnfs_block_submit_work);
-	INIT_WORK(&blinf->writeback_work, ngnfs_block_writeback_work);
 	init_waitqueue_head(&blinf->waitq);
+
+	ret = rhashtable_init(&blinf->ht, &ngnfs_block_ht_params);
+	if (ret < 0)
+		goto out_free;
+
+	/* XXX use fs identifier in name */
+	blinf->flush.wq = create_singlethread_workqueue("ngnfs-flush");
+	blinf->submit.wq = create_singlethread_workqueue("ngnfs-submit");
+	blinf->clean.wq = create_singlethread_workqueue("ngnfs-clean");
+	if (!blinf->flush.wq || !blinf->submit.wq || !blinf->clean.wq) {
+		ret = -ENOMEM;
+		goto out_destroy;
+	}
 
 	if (blinf->btr_ops->setup) {
 		blinf->btr_info = blinf->btr_ops->setup(nfi, btr_setup_arg);
 		if (IS_ERR(blinf->btr_info)) {
 			ret = PTR_ERR(blinf->btr_info);
-			goto out;
+			goto out_destroy;
 		}
 	}
 
 	blinf->queue_depth = blinf->btr_ops->queue_depth(nfi, blinf->btr_info);
-
-	ret = rhashtable_init(&blinf->ht, &ngnfs_block_ht_params);
-	if (ret < 0) {
-		kfree(blinf);
-		goto out;
-	}
-
-	/* XXX use fs identifier in name */
-	blinf->wq = create_singlethread_workqueue("ngnfs-workq");
-	if (!blinf->wq) {
-		rhashtable_destroy(&blinf->ht);
-		kfree(blinf);
-		ret = -ENOMEM;
-		goto out;
-	}
-
 	nfi->block_info = blinf;
 	ret = 0;
+	goto out;
+
+out_destroy:
+	destroy_block_work_list(&blinf->flush);
+	destroy_block_work_list(&blinf->submit);
+	destroy_block_work_list(&blinf->clean);
+	rhashtable_destroy(&blinf->ht);
+out_free:
+	kfree(blinf);
 out:
 	return ret;
 }
@@ -1072,7 +861,6 @@ static void free_ht_block(void *ptr, void *arg)
 {
 	struct ngnfs_block *bl = ptr;
 
-	/* XXX make sure this makes sense */
 	put_block(bl);
 }
 
@@ -1090,7 +878,9 @@ void ngnfs_block_destroy(struct ngnfs_fs_info *nfi)
 			blinf->btr_ops->shutdown(nfi, blinf->btr_info);
 
 		/* any queued work is drained before destruction */
-		destroy_workqueue(blinf->wq);
+		destroy_block_work_list(&blinf->flush);
+		destroy_block_work_list(&blinf->submit);
+		destroy_block_work_list(&blinf->clean);
 
 		if (blinf->btr_ops->destroy)
 			blinf->btr_ops->destroy(nfi, blinf->btr_info);

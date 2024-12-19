@@ -12,16 +12,45 @@ struct ngnfs_block;
 #include "shared/lk/types.h"
 
 typedef enum {
-	/* return a new block, allocate if missing, forget if existing */
-	NBF_NEW = (1 << 0),
-	/* acquire a read reference that can not be modified */
-	NBF_READ = (1 << 1),
 	/*
-	 * Acquire an exclusive reference with an intent to write.  The
-	 * block contents won't be directly written by the acquiring
-	 * caller but will be done within _dirty_begin and _dirty_end.
+	 * Acquire a read reference that can be shared with other readers.  Can not
+	 * be specified with _WRITE.
 	 */
-	NBF_WRITE = (1 << 2),
+	NBF_READ		= (1 << 0),
+	/*
+	 * Acquire an exclusive reference which excludes all other
+	 * readers and writers.  Can not be specified with _READ.  The
+	 * block will be recorded as dirty as this block is put (if
+	 * _NODIRTY is not specified with the put.)
+	 */
+	NBF_WRITE		= (1 << 1),
+	/*
+	 * Return an error instead of blocking waiting for (read|write) access.
+	 */
+	NBF_TRY			= (1 << 2),
+	/*
+	 * The caller is writing and will overwrite the current contents
+	 * of the block.  The block will be cached without reading from
+	 * the device.  The contents are undefined and the caller is
+	 * responsible for initializing the block.
+	 */
+	NBF_NEW			= (1 << 3),
+	/*
+	 * Stops a block from being considered dirty as a write
+	 * reference is put, if the block wasn't already dirty.  Used as
+	 * transactions are unwound and callers have reverted their
+	 * modification of the block so that we don't write out blocks
+	 * that haven't changed.
+	 */
+	NBF_NODIRTY		= (1 << 4),
+	/*
+	 * Must be specified with _WRITE.  The caller is promising, hope
+	 * to die, that they already have an existing _READ reference
+	 * and would like to convert it to the exclusive write
+	 * reference.  This will never block and will return an error if
+	 * there were multiple shared read references to the block.
+	 */
+	NBF_CONVERT_WRITE	= (1 << 5),
 } nbf_t;
 
 /* these flags are mutually exclusive */
@@ -43,9 +72,10 @@ struct ngnfs_block_transport_ops {
 };
 
 struct ngnfs_block *ngnfs_block_get(struct ngnfs_fs_info *nfi, u64 bnr, nbf_t nbf);
-void ngnfs_block_put(struct ngnfs_block *bl);
+void ngnfs_block_put(struct ngnfs_fs_info *nfi, struct ngnfs_block *bl, nbf_t nbf);
 void *ngnfs_block_buf(struct ngnfs_block *bl);
 struct page *ngnfs_block_page(struct ngnfs_block *bl);
+void ngnfs_block_dirty_limit_wait(struct ngnfs_fs_info *nfi);
 
 int ngnfs_block_dirty_begin(struct ngnfs_fs_info *nfi, struct list_head *list, ssize_t off);
 void ngnfs_block_dirty_end(struct ngnfs_fs_info *nfi, struct list_head *list, ssize_t off);
