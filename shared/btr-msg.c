@@ -101,9 +101,14 @@ static void *ngnfs_btr_msg_setup(struct ngnfs_fs_info *nfi, void *arg)
 	int ret;
 
 	ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_GET_BLOCK_RESULT,
-				      ngnfs_btr_msg_get_block_result) ?:
-	      ngnfs_msg_register_recv(nfi, NGNFS_MSG_WRITE_BLOCK_RESULT,
-				      ngnfs_btr_msg_write_block_result);
+				      ngnfs_btr_msg_get_block_result);
+	if (ret == 0) {
+		ret = ngnfs_msg_register_recv(nfi, NGNFS_MSG_WRITE_BLOCK_RESULT,
+					      ngnfs_btr_msg_write_block_result);
+		if (ret != 0)
+			ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_BLOCK_RESULT,
+						  ngnfs_btr_msg_get_block_result);
+	}
 	if (ret < 0)
 		return ERR_PTR(ret);
 
@@ -112,7 +117,8 @@ static void *ngnfs_btr_msg_setup(struct ngnfs_fs_info *nfi, void *arg)
 
 static void ngnfs_btr_msg_destroy(struct ngnfs_fs_info *nfi, void *btr_info)
 {
-	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_BLOCK_RESULT, ngnfs_btr_msg_get_block_result);
+	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_GET_BLOCK_RESULT,
+				  ngnfs_btr_msg_get_block_result);
 	ngnfs_msg_unregister_recv(nfi, NGNFS_MSG_WRITE_BLOCK_RESULT,
 				  ngnfs_btr_msg_write_block_result);
 }
