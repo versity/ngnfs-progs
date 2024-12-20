@@ -20,6 +20,7 @@
 #include "shared/lk/kernel.h"
 #include "shared/lk/limits.h"
 
+#include "shared/daemon.h"
 #include "shared/log.h"
 #include "shared/map.h"
 #include "shared/msg.h"
@@ -37,6 +38,7 @@ struct mapd_options {
 	struct sockaddr_in listen_addr;
 	struct list_head addr_list;
 	u8 nr_addrs;
+	bool foreground;
 	char *trace_path;
 };
 
@@ -91,6 +93,10 @@ static struct option_more mapd_moreopts[] = {
 	  .desc = "listening IPv4 address and port",
 	  .required = 1, },
 
+	{ .longopt = { "foreground", no_argument, NULL, 'f' },
+	  .desc = "do not daemonize and run in the foreground",
+	  .required = 0, },
+
 	{ .longopt = { "devd_addr", required_argument, NULL, 'd' },
 	  .arg = "addr:port",
 	  .desc = "IPv4 address of devd server",
@@ -111,6 +117,10 @@ static int parse_mapd_opt(int c, char *str, void *arg)
 	case 's':
 		ret = strdup_nerr(&opts->storage_dir, str);
 		break;
+	case 'f':
+		opts->foreground = true;
+		ret = 0;
+		break;
 	case 'l':
 		ret = parse_ipv4_addr_port(&opts->listen_addr, str);
 		break;
@@ -129,6 +139,7 @@ int main(int argc, char **argv)
 {
 	struct ngnfs_fs_info nfi = INIT_NGNFS_FS_INFO;
 	struct mapd_options opts = { .addr_list = LIST_HEAD_INIT(opts.addr_list), };
+	int pipefd[2];
 	int ret;
 
 	ret = getopt_long_more(argc, argv, mapd_moreopts, ARRAY_SIZE(mapd_moreopts), parse_mapd_opt,
@@ -136,15 +147,23 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		goto out;
 
-	ret = thread_prepare_main();
+	if (!opts.foreground)
+		ret = daemonize(pipefd);
+
 	if (ret < 0)
 		goto out;
 
-	ret = trace_setup(opts.trace_path) ?:
+	ret = thread_prepare_main() ?:
+	      trace_setup(opts.trace_path) ?:
 	      ngnfs_map_setup(&nfi) ?:
 	      ngnfs_msg_setup(&nfi, &ngnfs_mtr_socket_ops, NULL, &opts.listen_addr) ?:
-	      mapd_setup(&nfi, &opts.addr_list, opts.nr_addrs) ?:
-	      thread_sigwait();
+	      mapd_setup(&nfi, &opts.addr_list, opts.nr_addrs);
+
+	if (!opts.foreground)
+		daemon_report(pipefd, ret);
+
+	if (ret == 0)
+		thread_sigwait();
 
 	mapd_destroy(&nfi);
 	ngnfs_msg_destroy(&nfi);
