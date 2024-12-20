@@ -56,21 +56,39 @@ static int devd_get_block(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdes
 	}
 
 	ret = ngnfs_msg_send(nfi, &res_mdesc);
-	ngnfs_block_put(bl);
+	ngnfs_block_put(nfi, bl, NBF_READ);
 
 	return ret;
 }
 
 /*
+ * Write a block by dirtying it in the block cache and immediately
+ * syncing.  This is temporary and will change quite a bit once devd
+ * gets a more robust structure with journaled blocks and transactions.
+ *
  * We're copying the block contents today, but we should be able to swap
  * data pages as long as we appropriately manage concurrent readers.
  */
-static void commit_write_block(struct ngnfs_fs_info *nfi, struct ngnfs_transaction *txn,
-			       struct ngnfs_block *bl, void *arg)
+static int write_block_sync(struct ngnfs_fs_info *nfi, u64 bnr, struct page *data_page)
 {
-	struct page *data_page = arg;
+	struct ngnfs_transaction txn;
+	void *ptr;
+	int ret;
 
-	memcpy(ngnfs_block_buf(bl), page_address(data_page), NGNFS_BLOCK_SIZE);
+	ngnfs_txn_init(&txn);
+
+	do {
+		ret = ngnfs_txn_get_block(nfi, &txn, bnr, NBF_NEW | NBF_WRITE, NULL, &ptr);
+		if (ret == 0)
+			memcpy(ptr, page_address(data_page), NGNFS_BLOCK_SIZE);
+	} while (ngnfs_txn_retry(nfi, &txn, &ret));
+
+	ngnfs_txn_teardown(nfi, &txn);
+
+	if (ret == 0)
+		ret = ngnfs_block_sync(nfi);
+
+	return ret;
 }
 
 static int devd_write_block(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *mdesc)
@@ -90,12 +108,7 @@ static int devd_write_block(struct ngnfs_fs_info *nfi, struct ngnfs_msg_desc *md
 	}
 
 	/* XXX there'd be fs bnr -> dev bnr mapping */
-
-	ret = ngnfs_txn_add_block(nfi, &txn, le64_to_cpu(wb->bnr), NBF_NEW | NBF_WRITE,
-				  NULL, commit_write_block, mdesc->data_page) ?:
-	      ngnfs_txn_execute(nfi, &txn);
-	if (ret == 0)
-		ret = ngnfs_block_sync(nfi);
+	ret = write_block_sync(nfi, le64_to_cpu(wb->bnr), mdesc->data_page);
 
 	res.bnr = wb->bnr;
 	res.err = ngnfs_msg_err(ret);

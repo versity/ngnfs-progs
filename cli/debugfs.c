@@ -15,9 +15,10 @@
 #include "shared/lk/types.h"
 
 #include "shared/format-block.h"
+#include "shared/inode.h"
 #include "shared/log.h"
+#include "shared/mkfs.h"
 #include "shared/mount.h"
-#include "shared/pfs.h"
 #include "shared/thread.h"
 #include "shared/txn.h"
 
@@ -33,11 +34,9 @@ struct debugfs_context {
 
 static void cmd_mkfs(struct debugfs_context *ctx, int argc, char **argv)
 {
-	struct ngnfs_transaction txn = INIT_NGNFS_TXN(txn);
 	int ret;
 
-	ret = ngnfs_pfs_mkfs(ctx->nfi, &txn, NGNFS_ROOT_INO, ktime_get_real_ns());
-	ngnfs_txn_destroy(ctx->nfi, &txn);
+	ret = ngnfs_mkfs(ctx->nfi);
 	if (ret < 0) {
 		printf("mkfs error: "ENOF"\n", ENOA(-ret));
 		return;
@@ -50,12 +49,10 @@ static void cmd_mkfs(struct debugfs_context *ctx, int argc, char **argv)
 
 static void cmd_stat(struct debugfs_context *ctx, int argc, char **argv)
 {
-	struct ngnfs_transaction txn = INIT_NGNFS_TXN(txn);
 	struct ngnfs_inode ninode;
 	int ret;
 
-	ret = ngnfs_pfs_read_inode(ctx->nfi, &txn, NGNFS_ROOT_INO, &ninode, sizeof(ninode));
-	ngnfs_txn_destroy(ctx->nfi, &txn);
+	ret = ngnfs_inode_read_copy(ctx->nfi, NGNFS_ROOT_INO, &ninode, sizeof(ninode));
 
 	if (ret < 0) {
 		log("stat error: %d", ret);
