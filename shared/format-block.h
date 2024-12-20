@@ -115,8 +115,45 @@ struct ngnfs_inode {
 	__le64 ctime_nsec;
 	__le64 mtime_nsec;
 	__le64 crtime_nsec;
+	struct ngnfs_btree_root dirents;
 };
 
 #define NGNFS_ROOT_INO 1
+
+/*
+ * This is totally arbitrary.  It looks like it's 32bit in the stat ABI.
+ * Most local file systems have around U16_MAX, but some have U32_MAX.
+ */
+#define NGNFS_LINK_MAX	S32_MAX
+
+struct ngnfs_dirent {
+	__le64 ino;
+	__le64 version; /* XXX ? */
+	__u8 dtype;
+	__u8 name_len; /* no null termination */
+	__u8 name[6]; /* definition pads to alignment, stored can be smaller */
+};
+
+/* max dirent name length, without null term */
+#define NGNFS_NAME_MAX	255
+
+/* dirents must have at least 1 name byte */
+#define NGNFS_DIRENT_MIN_VAL_SIZE offsetof(struct ngnfs_dirent, name[1])
+
+/* just a random value */
+#define NGNFS_DIRENT_HASH_SEED	0xce94cad8f038f79a
+
+/*
+ * The low bit of the dirent key value (and readdir pos) is manually
+ * assigned to handle colliding name hash values.  We don't want the
+ * unlikely event of a single hash collision to prevent creation.
+ */
+#define NGNFS_DIRENT_COLL_BIT	1ULL
+
+/*
+ * We clear the high bit to avoid signed long telldir/seekdir and
+ * initially clear the collision bits.
+ */
+#define NGNFS_DIRENT_HASH_MASK	(U64_MAX ^ (1ULL << 63) ^ NGNFS_DIRENT_COLL_BIT)
 
 #endif
