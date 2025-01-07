@@ -55,7 +55,6 @@ static void cmd_stat(struct debugfs_context *ctx, int argc, char **argv)
 	int ret;
 
 	ret = ngnfs_pfs_read_inode(ctx->nfi, &txn, NGNFS_ROOT_INO, &ninode, sizeof(ninode));
-	ngnfs_txn_destroy(ctx->nfi, &txn);
 
 	if (ret < 0) {
 		log("stat error: %d", ret);
