@@ -198,6 +198,7 @@ static struct ngnfs_block *alloc_block(u64 bnr, bool with_page)
 	bl = kzalloc(sizeof(struct ngnfs_block), GFP_NOFS);
 	if (bl) {
 		atomic_set(&bl->refcount, 1);
+		init_llist_node(&bl->dirty_llnode);
 		init_llist_node(&bl->submit_llnode);
 		INIT_LIST_HEAD(&bl->submit_head);
 		init_waitqueue_head(&bl->waitq);
@@ -438,19 +439,26 @@ void ngnfs_block_end_io(struct ngnfs_fs_info *nfi, u64 bnr, struct page *data_pa
  * We preserve list order (for sync especially) so we walk the llist
  * lifo and construct a private fifo that is then spliced onto the end
  * of the caller's existing list.
+ *
+ * The lockless list is destroyed and its nodes are re-initialized as we
+ * go.  The caller is only using the nodes to get the item on their
+ * private list.  They can then add the items to other lockless lists as
+ * needed.
  */
 static void del_all_reverse_add_tail(struct list_head *list, struct llist_head *llist,
 				     ssize_t offset)
 {
+	struct llist_node *first;
 	struct llist_node *node;
-	struct llist_node *pos;
+	struct llist_node *n;
 	struct list_head *head;
 	LIST_HEAD(reverse);
 
-	node = llist_del_all(llist);
-	if (node) {
-		llist_for_each(pos, node) {
-			head = (void *)pos + offset;
+	first = llist_del_all(llist);
+	if (first) {
+		llist_for_each_safe(node, n, first) {
+			head = (void *)node + offset;
+			init_llist_node(node);
 			list_add(head, &reverse);
 		}
 		list_splice_tail(&reverse, list);
@@ -493,7 +501,6 @@ static void ngnfs_block_submit_work(struct work_struct *work)
 		if (submitted == space)
 			break;
 
-		init_llist_node(&bl->submit_llnode);
 		list_del_init(&bl->submit_head);
 
 		/* XXX _GET_WRITE isn't implemented */
