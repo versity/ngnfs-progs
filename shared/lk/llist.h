@@ -150,4 +150,9 @@ static inline struct llist_node *llist_del_all(struct llist_head *head)
 	     pos != NULL;									\
              pos = _llist_for_each_next(pos))							\
 
+#define llist_for_each_safe(pos, n, node)							\
+        for (pos = _llist_for_each_first(pos, node);						\
+	     (pos != NULL) && ((n = _llist_for_each_next(pos)), true);				\
+             pos = n)										\
+
 #endif
