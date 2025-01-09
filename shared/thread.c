@@ -21,19 +21,21 @@ enum {
 	THR_SHOULD_RETURN,
 };
 
-static void register_thread(void)
+static int register_thread(void)
 {
 	int ret;
 
-	rcu_register_thread();
 	ret = trace_register_thread();
-	assert(ret == 0); /* XXX */
+	if (ret == 0)
+		rcu_register_thread();
+
+	return ret;
 }
 
 static void unregister_thread(void)
 {
-	trace_unregister_thread();
 	rcu_unregister_thread();
+	trace_unregister_thread();
 }
 
 /*
@@ -56,12 +58,11 @@ int thread_prepare_main(void)
 	if (ret != 0) {
 		ret = -errno;
 		log("error masking signals: "ENOF, ENOA(-ret));
+		goto out;
 	}
 
-	ret = trace_init();
-	if (ret == 0)
-		register_thread();
-
+	ret = register_thread();
+out:
 	return ret;
 }
 
@@ -72,7 +73,6 @@ int thread_prepare_main(void)
 void thread_finish_main(void)
 {
 	unregister_thread();
-	trace_destroy();
 }
 
 /*
@@ -95,31 +95,50 @@ int thread_sigwait(void)
 		}
 
 		printf("got signal %u, exiting\n", sig);
-		trace_flush();
 		exit(1);
 	}
 
 	return ret;
 }
 
+/*
+ * Our wrapper initializes per-thread resources.  Unfortunately, tracing
+ * needs to call pthread_setspecific from the thread context and it can
+ * return an error so we need to coordinate with the starting caller.
+ */
 static void *thread_fn_wrapper(void *arg)
 {
 	struct thread *thr = arg;
+	int ret;
 
-	register_thread();
+	ret = register_thread();
 
-	thr->fn(thr, thr->arg);
+	pthread_mutex_lock(&thr->mutex);
+	set_bit(THR_CREATED, &thr->bits);
+	thr->start_err = ret;
+	pthread_cond_signal(&thr->cond);
+	pthread_mutex_unlock(&thr->mutex);
 
-	unregister_thread();
+	if (thr->start_err == 0) {
+		thr->fn(thr, thr->arg);
+		unregister_thread();
+	}
 
 	return NULL;
 }
 
 void thread_init(struct thread *thr)
 {
+	pthread_mutex_init(&thr->mutex, NULL);
+	pthread_cond_init(&thr->cond, NULL);
+	thr->start_err = -ENOENT; /* don't wait if we never started */
 	thr->bits = 0;
 }
 
+/*
+ * Returns success when a thread will run the caller's fn.  Returns an
+ * error if the fn will never execute and there is no thread running.
+ */
 int thread_start(struct thread *thr, thread_fn_t fn, void *arg)
 {
 	int ret;
@@ -130,11 +149,19 @@ int thread_start(struct thread *thr, thread_fn_t fn, void *arg)
 	ret = pthread_create(&thr->pthread, NULL, thread_fn_wrapper, thr);
 	if (ret != 0) {
 		ret = -ret;
-	} else {
-		set_bit(THR_CREATED, &thr->bits);
-		ret = 0;
+		thr->start_err = ret;
+		goto out;
 	}
 
+	pthread_mutex_lock(&thr->mutex);
+	while (!test_bit(THR_CREATED, &thr->bits))
+		pthread_cond_wait(&thr->cond, &thr->mutex);
+	ret = thr->start_err;
+	pthread_mutex_unlock(&thr->mutex);
+	if (ret < 0)
+		pthread_join(thr->pthread, NULL);
+
+out:
 	return ret;
 }
 
@@ -152,7 +179,7 @@ void thread_stop_wait(struct thread *thr)
 {
 	int ret;
 
-	if (test_bit(THR_CREATED, &thr->bits)) {
+	if (thr->start_err == 0) {
 		thread_stop_indicate(thr);
 		ret = pthread_join(thr->pthread, NULL);
 		assert(ret == 0);

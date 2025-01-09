@@ -88,7 +88,7 @@ BEGIN {
 		fields = (fields newline "  " type " " arg ";")
 
 		# assignment
-		assign = (assign newline "    ev->" arg " = " arg ";")
+		assign = (assign newline "  ev->" arg " = " arg ";")
 #		print assign
 
 		# printf format
@@ -110,17 +110,13 @@ BEGIN {
 	print "static inline void trace_ngnfs_" name "(" args ")\n"		\
 		"{\n"								\
 		"  " struct " *ev;\n"						\
-		"  trace_store_begin();\n"					\
-		"  ev = trace_store_ptr(" id ", sizeof(" struct "));\n"		\
-		"  if (ev) {\n"							\
-		     assign "\n"						\
-		"  }\n"								\
-		"  trace_store_end();\n"					\
+		"  ev = trace_entry_ptr(" id ", sizeof(struct ngnfs_trace_event) + sizeof(" struct "));\n"		\
+		   assign "\n"							\
 		"}\n"
 
 	print_cases = (print_cases "  case " id ":\n"				\
 		"    { " struct " *ev = ptr;\n"					\
-		"      printf(\"" pf_fmt "\\n\", " pf_args ");\n"		\
+		"      printf(\"" name " " pf_fmt "\\n\", " pf_args ");\n"		\
 		"      break; }\n")
 }
 END { 

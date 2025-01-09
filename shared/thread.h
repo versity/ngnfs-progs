@@ -9,10 +9,13 @@ struct thread;
 typedef void (*thread_fn_t)(struct thread *thr, void *arg);
 
 struct thread {
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int start_err;
+	pthread_t pthread;
 	unsigned long bits;
 	thread_fn_t fn;
 	void *arg;
-	pthread_t pthread;
 };
 
 int thread_prepare_main(void);

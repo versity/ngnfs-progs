@@ -96,7 +96,8 @@ int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 	int ret;
 
 	ret = getopt_long_more(argc, argv, mount_moreopts, ARRAY_SIZE(mount_moreopts),
-			       parse_mount_opt, &opts);
+			       parse_mount_opt, &opts) ?:
+	      trace_setup(opts.trace_path);
 	if (ret < 0)
 		goto out;
 
@@ -106,8 +107,7 @@ int ngnfs_mount(struct ngnfs_fs_info *nfi, int argc, char **argv)
 		goto out;
 	}
 
-	ret = trace_setup(opts.trace_path) ?:
-	      ngnfs_manifest_setup(nfi, &opts.addr_list, opts.nr_addrs) ?:
+	ret = ngnfs_manifest_setup(nfi, &opts.addr_list, opts.nr_addrs) ?:
 	      ngnfs_msg_setup(nfi, &ngnfs_mtr_socket_ops, NULL, NULL) ?:
 	      ngnfs_block_setup(nfi, &ngnfs_btr_msg_ops, NULL);
 out:
@@ -127,4 +127,5 @@ void ngnfs_unmount(struct ngnfs_fs_info *nfi)
 	ngnfs_block_destroy(nfi);
 	ngnfs_msg_destroy(nfi);
 	ngnfs_manifest_destroy(nfi);
+	trace_destroy();
 }

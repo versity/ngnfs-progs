@@ -1,18 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+#define _GNU_SOURCE /* gettid() */
+
 #include <unistd.h>
 #include <errno.h>
 #include <sys/uio.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
+#include "shared/lk/atomic.h"
 #include "shared/lk/bitops.h"
 #include "shared/lk/build_bug.h"
 #include "shared/lk/byteorder.h"
 #include "shared/lk/err.h"
+#include "shared/lk/limits.h"
 #include "shared/lk/list.h"
 #include "shared/lk/math.h"
 #include "shared/lk/minmax.h"
 #include "shared/lk/mutex.h"
+#include "shared/lk/timekeeping.h"
 #include "shared/lk/wait.h"
 
 #include "shared/format-trace.h"
@@ -20,346 +26,196 @@
 #include "shared/trace.h"
 #include "shared/urcu.h"
 
-#define BUF_SIZE (32 * 1024)
-#define NR_BUFS (1024 * 1024 / BUF_SIZE)
-
 /*
- * userspace tracing stores tracing events in private per-thread buffer
- * pools.  As buffers fill they're handed to a writing thread.  When the
- * writing thread is done they're available for storing again.  If all
- * the buffers are writing then trace events are dropped.
+ * This userspace tracing facility has the following goals:
+ *
+ * 1) Low trace event cost.  We can easily have order 10 events per IO,
+ * and devices can have order 100000 IO/s.  The cpu cost of each trace
+ * call is aggressively minimized, to the inconvenience of nearly
+ * everything else.  Each trace event boils down to an inline struct
+ * initialization.
+ *
+ * 2) Preserve traces as proccesses are killed without process
+ * cooperation.  This first pass takes the easiest route and uses
+ * mmapped files.
+ *
+ * 3) Implement tracing function calls that mirror the kernel's
+ * TRACE_EVENT() style tracing.  We have build tooling to generate the
+ * trace event implementations from event specifications.
+ *
+ * On trace_setup() we open the tracing file.  Each thread then maps a
+ * region of the file as its buffer.  Region setup is expensive and the
+ * regions are never reclaimed so this is only appropriate for a small
+ * number of long lived threads.
+ *
+ * Variable length traces are stored in the buffer as a ring, and the
+ * buffer is divided into fixed size chunks.  Each event's location is
+ * rounded up to the next chunk if it would span chunks.  This ensures
+ * that we can alwasys start reading from events at the start of chunks
+ * as we wrap around the ring.
  */
 
 struct trace_info {
-	struct mutex mutex;
-	struct cds_list_head threads;
-
+	atomic64_t thread_nr;
 	int fd;
-	wait_queue_head_t waitq;
-	struct thread write_thr;
-	struct cds_wfcq_head write_head;
-	struct cds_wfcq_tail write_tail;
+	bool have_key;
+	int page_size;
 };
 
-struct trace_buf {
-	int refcount;
-	struct cds_wfcq_node node;	/* sending to write thread */
-	struct list_head head;		/* private to appending thread */
-	unsigned long bits;
-	void *ptr;
-	size_t len;
-	size_t size;
-};
-
-enum {
-	TB_WRITING = 0,
-};
-
-struct trace_thread_private {
-	struct cds_list_head head;
-	struct list_head bufs;
-	struct trace_buf *storing_buf;
-};
-
-typedef struct trace_thread_private tpriv_tls_t;
-static DEFINE_URCU_TLS(tpriv_tls_t, tpriv_tls);
+pthread_key_t trace_thread_private_key;
 
 /* see comment above trace_setup() */
 static struct trace_info *global_trinf = NULL;
 
-static struct trace_buf *alloc_tbuf(void)
-{
-	struct trace_buf *tbuf;
-
-	tbuf = malloc(sizeof(struct trace_buf) + BUF_SIZE);
-	if (tbuf) {
-		tbuf->refcount = 1;
-		cds_wfcq_node_init(&tbuf->node);
-		INIT_LIST_HEAD(&tbuf->head);
-		tbuf->bits = 0;
-		tbuf->ptr = (void *)(tbuf + 1);
-		tbuf->len = 0;
-		tbuf->size = BUF_SIZE;
-	}
-
-	return tbuf;
-}
-
-static void put_tbuf(struct trace_buf *tbuf)
-{
-	if (tbuf && uatomic_add_return(&tbuf->refcount, -1) == 0)
-		free(tbuf);
-}
-
-static void get_tbuf(struct trace_buf *tbuf)
-{
-	uatomic_add(&tbuf->refcount, 1);
-}
-
 /*
- * When buffers are ready to be written they're enqueued for the writing
- * thread.  Flush can enqueue bufs while threads are still storing into
- * them so we wait for an rcu grace period for stores to drain before
- * writing.  Once we're done writing we re-initialize the buffer, clear
- * the writing bit, and drop our reference.
- */
-static void trace_write_thread(struct thread *thr, void *arg)
-{
-	struct trace_info *trinf = arg;
-	struct cds_wfcq_node *node;
-	struct cds_wfcq_head head;
-	struct cds_wfcq_tail tail;
-	struct iovec *iov = NULL;
-	struct trace_buf *tbuf;
-	LIST_HEAD(list);
-	ssize_t total;
-	ssize_t sret;
-	int iovsize = 0;
-	int iovcnt;
-	void *new;
-
-	cds_wfcq_init(&head, &tail);
-
-	/* always try to write traces before returning */
-	do {
-		wait_event(&trinf->waitq, !cds_wfcq_empty(&trinf->write_head, &trinf->write_tail) ||
-			   thread_should_return(thr));
-
-		__cds_wfcq_splice_nonblocking(&head, &tail, &trinf->write_head, &trinf->write_tail);
-
-		/* wait for stores into write bufs to finish */
-		synchronize_rcu();
-
-		iovcnt = 0;
-		total = 0;
-		__cds_wfcq_for_each_blocking(&head, &tail, node) {
-			tbuf = caa_container_of(node, struct trace_buf, node);
-
-			if (iovcnt == iovsize) {
-				iovsize += 16;
-				new = reallocarray(iov, iovsize, sizeof(struct iovec));
-				assert(new); /* XXX */
-				iov = new;
-			}
-
-			iov[iovcnt].iov_base = tbuf->ptr;
-			iov[iovcnt].iov_len = tbuf->len;
-			iovcnt++;
-			total += tbuf->len;
-		}
-
-		sret = writev(trinf->fd, iov, iovcnt);
-		assert(sret == total); /* XXX */
-
-		/* let destroy know we're done, usually does nothing */
-		wake_up(&trinf->waitq);
-
-		while ((node = __cds_wfcq_dequeue_nonblocking(&head, &tail))) {
-			tbuf = caa_container_of(node, struct trace_buf, node);
-
-			tbuf->len = 0;
-			cds_wfcq_node_init(&tbuf->node);
-			cmm_barrier(); /* re-init node before clearing writing enables use */
-			clear_bit(TB_WRITING, &tbuf->bits);
-			put_tbuf(tbuf);
-		}
-	} while (!thread_should_return(thr));
-
-	free(iov);
-}
-
-/*
- * If we set the writing bit then grab a ref and enqueue the buf for the
- * writer.
- */
-static void try_enqueue_writing(struct trace_info *trinf, struct trace_buf *tbuf)
-{
-	if (!test_and_set_bit(TB_WRITING, &tbuf->bits)) {
-		cmm_barrier(); /* set bit before using tbuf */
-		get_tbuf(tbuf);
-		cds_wfcq_enqueue(&trinf->write_head, &trinf->write_tail, &tbuf->node);
-		wake_up(&trinf->waitq);
-	}
-}
-
-/*
- * Return a pointer for the caller to store their new trace event.  The
- * caller is holding an RCU read lock the duration of their use of the
- * pointer.
- */
-void *trace_store_ptr(u16 id, size_t len)
-{
-	struct trace_thread_private *tpriv = &URCU_TLS(tpriv_tls);
-	struct trace_info *trinf = global_trinf;
-	struct ngnfs_trace_event_header *hdr;
-	struct trace_buf *tbuf;
-	size_t total;
-	void *ptr;
-
-	if (!trinf)
-		return NULL;
-
-	tbuf = rcu_dereference(tpriv->storing_buf);
-
-	/* total includes header and final alignment padding */
-	total = sizeof(struct ngnfs_trace_event_header) + round_up(len, sizeof(u64));
-
-	/* see if buffer is full or flush started writing it */
-	if (tbuf && ((tbuf->len + total > tbuf->size) || test_bit(TB_WRITING, &tbuf->bits))) {
-		try_enqueue_writing(trinf, tbuf);
-
-		/* move the writing buf to the end */
-		list_move_tail(&tbuf->head, &tpriv->bufs);
-		rcu_assign_pointer(tpriv->storing_buf, NULL);
-		tbuf = NULL;
-	}
-
-	/* try to get the next buf, dropping events until the next is done writing */
-	if (!tbuf) {
-		tbuf = list_first_entry_or_null(&tpriv->bufs, struct trace_buf, head);
-		if (!tbuf || test_bit(TB_WRITING, &tbuf->bits))
-			return NULL;
-
-		rcu_assign_pointer(tpriv->storing_buf, tbuf);
-	}
-
-	hdr = tbuf->ptr;
-	hdr->id = cpu_to_le16(id);
-	hdr->size = cpu_to_le16(total);
-
-	ptr = (void *)(hdr + 1);
-	tbuf->len += total;
-
-	return ptr;
-}
-
-/*
- * Flushing trace events makes all traces visible that were in thread
- * buffers before the flush call.  We iterate over all the threads, mark
- * their current storing bufs as writing, and send them to the writer.
- *
- * We hold the RCU lock while getting buf refs via the storing_buf
- * pointer.  Exiting threads will wait for our grace period to expire
- * before freeing their tpriv that we're iterating over.
- */
-void trace_flush(void)
-{
-	struct trace_info *trinf = global_trinf;
-	struct trace_thread_private *tpriv;
-	struct trace_buf *tbuf;
-
-	rcu_read_lock();
-
-	cds_list_for_each_entry_rcu(tpriv, &trinf->threads, head) {
-		tbuf = rcu_dereference(tpriv->storing_buf);
-		if (tbuf)
-			try_enqueue_writing(trinf, tbuf);
-	}
-
-	rcu_read_unlock();
-
-	/* wait for writer to finish with queued bufs */
-	wait_event(&trinf->waitq, !cds_wfcq_empty(&trinf->write_head, &trinf->write_tail));
-}
-
-static void put_list_bufs(struct list_head *list)
-{
-	struct trace_buf *tbuf;
-
-	while ((tbuf = list_first_entry_or_null(list, struct trace_buf, head))) {
-		list_del_init(&tbuf->head);
-		put_tbuf(tbuf);
-	}
-}
-
-/*
- * This presumes that threads are few and long lived.  We
- * unconditionally allocate large per-thread tracing buffers for all
- * threads, regardless of whether tracing is in use or not.  The urcu
- * tls helpers don't have a very useful init mechanism, so we initialize
- * newly allocated tpriv here as the first possible user in the thread.
+ * trace_setup() has created the file.  We fallocate and map the buffer
+ * in the file for our thread nr.  This is very expensive so it won't do
+ * well if we have high thread create rates (don't do that).
  */
 int trace_register_thread(void)
 {
-	struct trace_thread_private *tpriv = &URCU_TLS(tpriv_tls);
+	struct trace_thread_private *tpriv = NULL;
 	struct trace_info *trinf = global_trinf;
-	struct trace_buf *tbuf;
+	struct ngnfs_trace_thread *tthr;
+	void *addr = MAP_FAILED;
+	off_t page_off;
+	off_t off;
+	u64 nr;
 	int ret;
-	int i;
 
 	if (!trinf) {
 		ret = 0;
 		goto out;
 	}
 
-	/* urcu_tls can return null from its calloc */
+	tpriv = malloc(sizeof(struct trace_thread_private));
 	if (!tpriv) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	CDS_INIT_LIST_HEAD(&tpriv->head);
-	INIT_LIST_HEAD(&tpriv->bufs);
-	tpriv->storing_buf = NULL;
+	nr = atomic64_inc_return(&trinf->thread_nr);
+	off = TRACE_CHUNK_SIZE + (nr * TRACE_THREAD_SIZE);
+	page_off = off & (trinf->page_size - 1);
 
-	for (i = 0; i < NR_BUFS; i++) {
-		tbuf = alloc_tbuf();
-		if (!tbuf) {
-			put_list_bufs(&tpriv->bufs);
-			ret = -ENOMEM;
-			goto out;
-		}
-
-		list_add(&tbuf->head, &tpriv->bufs);
+	ret = posix_fallocate(trinf->fd, off, TRACE_THREAD_SIZE);
+	if (ret < 0) {
+		ret = -errno;
+		goto out;
 	}
 
-	mutex_lock(&trinf->mutex);
-	cds_list_add_tail_rcu(&tpriv->head, &trinf->threads);
-	mutex_unlock(&trinf->mutex);
+	/* MAP_LOCKED might be nice, but it runs into rlimit fast */
+	addr = mmap(NULL, page_off + TRACE_THREAD_SIZE, PROT_READ | PROT_WRITE,
+		    MAP_SHARED | MAP_POPULATE, trinf->fd, off - page_off);
+	if (addr == MAP_FAILED) {
+		ret = -errno;
+		goto out;
+	}
+
+	tthr = addr + page_off;
+	tthr->tid = gettid();
+
+	tpriv->addr = addr;
+	tpriv->buf = addr + page_off + TRACE_CHUNK_SIZE;
+	tpriv->offset = 0;
+	tpriv->mask = TRACE_BUF_SIZE - 1;
+
+	ret = pthread_setspecific(trace_thread_private_key, tpriv);
+	if (ret > 0) {
+		ret = -ret;
+		goto out;
+	}
 
 	ret = 0;
 out:
+	if (ret < 0) {
+		if (addr != MAP_FAILED)
+			munmap(addr, TRACE_BUF_SIZE);
+		free(tpriv);
+	}
+
 	return ret;
 }
 
 void trace_unregister_thread(void)
 {
-	struct trace_thread_private *tpriv = &URCU_TLS(tpriv_tls);
+	struct trace_thread_private *tpriv = trace_get_tpriv();
 	struct trace_info *trinf = global_trinf;
-	struct trace_buf *tbuf;
 
 	if (!trinf || !tpriv)
 		return;
 
-	rcu_read_lock();
+	munmap(tpriv->addr, TRACE_BUF_SIZE);
+	free(tpriv);
 
-	/* remove our thread from the threads list */
-	mutex_lock(&trinf->mutex);
-	cds_list_del_rcu(&tpriv->head);
-	mutex_unlock(&trinf->mutex);
+	pthread_setspecific(trace_thread_private_key, NULL);
+}
 
-	/* start write on remaining partial buf (has to be idle, we'd be storing) */
-	tbuf = rcu_dereference(tpriv->storing_buf);
-	if (tbuf) {
-		try_enqueue_writing(trinf, tbuf);
-		rcu_assign_pointer(tpriv->storing_buf, NULL);
+struct cpuid_result {
+	u32 eax;
+	u32 ebx;
+	u32 ecx;
+	u32 edx;
+};
+
+static void cpuid(u32 inp, struct cpuid_result *res)
+{
+	static u32 count = 0;
+	asm("cpuid			\n\t"
+	    : "=a" (res->eax), "=b" (res->ebx), "=c" (res->ecx), "=d" (res->edx)
+	    : "0" (inp), "2" (count));
+}
+
+/*
+ * SDM Vol 2A 3-237:
+ *
+ * EAX = 15H
+ *	EAX Bits 31-00: denominator of the TSC/”core crystal clock” ratio.
+ *	EBX Bits 31-00: numerator of the TSC/”core crystal clock” ratio.
+ *	ECX Bits 31-00: nominal frequency of the core crystal clock in Hz.
+ *
+ * This is obviously wildly intel specific.  We'll need to flesh this
+ * out for other platforms with a generic fallback.
+ */
+static void describe_ticks(struct ngnfs_trace_file *tfi)
+{
+	struct cpuid_result res;
+	ktime_t begin_ns;
+	ktime_t end_ns;
+	u64 begin_tick;
+	u64 end_tick;
+	u64 shortest;
+	int i;
+
+	shortest = U64_MAX;
+	for (i = 0; i < 10; i++) {
+		begin_tick = caa_get_cycles();
+		begin_ns = ktime_get_real_ns();
+		end_ns = ktime_get_real_ns();
+		end_tick = caa_get_cycles();
+
+		if (end_tick > begin_tick && (end_tick - begin_tick) < shortest) {
+			shortest = end_tick - begin_tick;
+			tfi->synchro_tick = (begin_tick + end_tick) >> 1;
+			tfi->synchro_nsec = (begin_ns + end_ns) >> 1;
+		}
 	}
-	rcu_read_unlock();
 
-	/* wait for list/storing_buf readers (flush) to finish before putting/freeing */
-	if (tbuf)
-		synchronize_rcu();
-
-	put_list_bufs(&tpriv->bufs);
-	/*
-	 * XXX Not sure if we're responsible for freeing tpriv or not..
-	 * Seems so?
-	 */
+	cpuid(0, &res);
+	if (res.eax >= 0x15) {
+		cpuid(0x15, &res);
+		if (res.eax && res.ebx && res.ecx) {
+			/* ticks / sec = res.ecx * res.ebx / res.eax */
+			tfi->nsec_per_tick_num = (u64)res.eax * NSEC_PER_SEC;
+			tfi->nsec_per_tick_denom = (u64)res.ecx * res.ebx;
+		}
+	}
 }
 
 /*
  * Initialize the global trace state that's required for thread
- * registration.  This is done very early.
+ * registration.  This is done very early, typically just after option
+ * parsing to get the trace file name.
  *
  * The userspace tracing layer is a little different than other layers
  * that are shared with the kernel module.  It inherits its interface
@@ -370,51 +226,61 @@ void trace_unregister_thread(void)
  * have one filesystem but it explains why this setup doesn't take an
  * nfi argument and why we have an unconventional global_trinf pointer.
  */
-int trace_init(void)
+int trace_setup(char *trace_path)
 {
+	struct ngnfs_trace_file *tfi = NULL;
 	struct trace_info *trinf;
 	int ret;
 
 	trinf = malloc(sizeof(struct trace_info));
-	if (!trinf) {
+	tfi = calloc(1, TRACE_CHUNK_SIZE);
+	if (!trinf || !tfi) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	mutex_init(&trinf->mutex);
-	CDS_INIT_LIST_HEAD(&trinf->threads);
+	atomic64_set(&trinf->thread_nr, U64_MAX); /* 0 is first assigned */
 	trinf->fd = -1;
-	init_waitqueue_head(&trinf->waitq);
-	thread_init(&trinf->write_thr);
-	cds_wfcq_init(&trinf->write_head, &trinf->write_tail);
+	trinf->have_key = false;
+	trinf->page_size = sysconf(_SC_PAGE_SIZE);
 
 	global_trinf = trinf;
-	ret = 0;
-out:
-	return ret;
-}
 
-int trace_setup(char *trace_path)
-{
-	struct trace_info *trinf = global_trinf;
-	int ret;
-
-	if (!trinf)
-		return 0;
-
-	trinf->fd = open(trace_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
+	trinf->fd = open(trace_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
 	if (trinf->fd < 0) {
-		ret = -ENOMEM;
+		ret = -errno;
 		goto out;
 	}
 
-	/* start writing thread after trinf is initialized for its _register_thread */
-	ret = thread_start(&trinf->write_thr, trace_write_thread, trinf);
-out:
-	if (ret < 0 && trinf->fd >= 0) {
-		close(trinf->fd);
-		trinf->fd = -1;
+	tfi->endian = NGNFS_TRACE_NATIVE_ENDIAN;
+	tfi->synchro_tick = 0;
+	tfi->synchro_nsec = 0;
+	tfi->nsec_per_tick_num = 1;
+	tfi->nsec_per_tick_denom = 1;
+
+	describe_ticks(tfi);
+
+	ret = pwrite(trinf->fd, tfi, TRACE_CHUNK_SIZE, 0);
+	if (ret != TRACE_CHUNK_SIZE) {
+		if (ret >= 0)
+			ret = -EIO;
+		else
+			ret = -errno;
+		goto out;
 	}
+
+	ret = pthread_key_create(&trace_thread_private_key, NULL);
+	if (ret > 0) {
+		ret = -ret;
+		goto out;
+	}
+
+	trinf->have_key = true;
+	ret = 0;
+out:
+	free(tfi);
+	if (ret < 0)
+		trace_destroy();
 
 	return ret;
 }
@@ -428,22 +294,10 @@ void trace_destroy(void)
 	struct trace_info *trinf = global_trinf;
 
 	if (trinf) {
-		/* wait for writer to finish with queued bufs */
-		wait_event(&trinf->waitq, !cds_wfcq_empty(&trinf->write_head, &trinf->write_tail));
-
-		/* then shut it down */
-		thread_stop_indicate(&trinf->write_thr);
-		wake_up(&trinf->waitq);
-		thread_stop_wait(&trinf->write_thr);
-
 		if (trinf->fd >= 0)
 			close(trinf->fd);
-
-		/*
-		 * XXX I wonder if we're supposed to clean up any
-		 * URCU_TLS() state that was built up.
-		 */
-
+		if (trinf->have_key)
+			pthread_key_delete(trace_thread_private_key);
 		free(trinf);
 		global_trinf = NULL;
 	}

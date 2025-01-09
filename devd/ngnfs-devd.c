@@ -80,7 +80,8 @@ int main(int argc, char **argv)
 	int ret;
 
 	ret = getopt_long_more(argc, argv, devd_moreopts, ARRAY_SIZE(devd_moreopts),
-			       parse_devd_opt, &opts);
+			       parse_devd_opt, &opts) ?:
+	      trace_setup(opts.trace_path);
 	if (ret < 0)
 		goto out;
 
@@ -88,8 +89,7 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		goto out;
 
-	ret = trace_setup(opts.trace_path) ?:
-	      ngnfs_msg_setup(&nfi, &ngnfs_mtr_socket_ops, NULL, &opts.listen_addr) ?:
+	ret = ngnfs_msg_setup(&nfi, &ngnfs_mtr_socket_ops, NULL, &opts.listen_addr) ?:
 	      ngnfs_block_setup(&nfi, &ngnfs_btr_aio_ops, opts.dev_path) ?:
 	      devd_recv_setup(&nfi) ?:
 	      thread_sigwait();
@@ -100,5 +100,6 @@ int main(int argc, char **argv)
 
 	thread_finish_main();
 out:
+	trace_destroy();
 	return !!ret;
 }
